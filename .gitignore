@@ -1,0 +1,13 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Benchmark output: commit only small summaries under results/
+results/raw/
+
+# IDE
+.idea/

@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package streamlab.tokenstream.v1;
+
+option java_multiple_files = true;
+option java_package = "io.github.cemharput.streamlab.tokenstream.v1";
+
+// Synthetic token producer. Content is deterministic and carries no meaning;
+// timings are configurable so that latency numbers are never mistaken for
+// real LLM time-to-first-token.
+service TokenStreamService {
+  // Server-streaming generation. The stream ends with exactly one of:
+  //   - a chunk with last = true followed by OK status
+  //   - a non-OK status (injected fault, cancellation or deadline)
+  rpc GenerateTokens(GenerateRequest) returns (stream TokenChunk);
+}
+
+// Out-of-band counters so tests and benchmarks can verify that upstream work
+// actually stopped after a cancel, timeout or disconnect.
+service SimulatorAdminService {
+  rpc GetStats(GetStatsRequest) returns (SimulatorStats);
+}
+
+message GenerateRequest {
+  // Caller-supplied id, echoed on every chunk. Required.
+  string request_id = 1;
+  StreamProfile profile = 2;
+  FaultSpec fault = 3;
+  // First sequence number to emit. Chunks are a pure function of
+  // (seed, request_id, seq), so a resumed stream continues byte-identically.
+  uint32 resume_from_seq = 4;
+  uint64 seed = 5;
+}
+
+message StreamProfile {
+  // Delay before the first chunk of this call (applied on resume too).
+  uint32 first_chunk_delay_ms = 1;
+  // Total chunks in the logical stream, seq 0 .. chunk_count - 1. Required, > 0.
+  uint32 chunk_count = 2;
+  uint32 chunk_interval_ms = 3;
+  // Approximate payload size per chunk; 0 means a single synthetic word.
+  uint32 chunk_size_bytes = 4;
+}
+
+enum FaultType {
+  FAULT_TYPE_NONE = 0;
+  // Terminate with UNAVAILABLE (retryable from the client's point of view).
+  FAULT_TYPE_UNAVAILABLE = 1;
+  // Terminate with INTERNAL (non-retryable).
+  FAULT_TYPE_INTERNAL = 2;
+  // Stop emitting and never terminate; only a client cancel or deadline ends
+  // the call. Used for timeout tests.
+  FAULT_TYPE_HANG = 3;
+}
+
+message FaultSpec {
+  FaultType type = 1;
+  // The fault fires instead of emitting the chunk with this seq.
+  uint32 at_seq = 2;
+}
+
+message TokenChunk {
+  string request_id = 1;
+  uint32 seq = 2;
+  string text = 3;
+  // True only on seq == chunk_count - 1.
+  bool last = 4;
+  // Simulator wall clock at emit time; informational, not used for latency.
+  int64 emitted_at_epoch_micros = 5;
+}
+
+message GetStatsRequest {}
+
+message SimulatorStats {
+  // Generations currently holding a scheduled task or waiting for flow control.
+  int64 active_generations = 1;
+  int64 started_total = 2;
+  int64 completed_total = 3;
+  int64 cancelled_total = 4;
+  int64 faulted_total = 5;
+  int64 rejected_total = 6;
+  int64 chunks_emitted_total = 7;
+  // Times a generation paused because the transport was not ready (backpressure).
+  int64 flow_control_pauses_total = 8;
+}
