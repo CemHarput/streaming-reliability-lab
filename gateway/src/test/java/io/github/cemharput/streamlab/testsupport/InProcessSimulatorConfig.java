@@ -21,6 +21,11 @@ public class InProcessSimulatorConfig {
 
     private final String name = InProcessServerBuilder.generateName();
 
+    /** The in-process server name, so tests can open their own channel to the simulator (e.g. for its stats). */
+    public String serverName() {
+        return name;
+    }
+
     @Bean(destroyMethod = "stop")
     SimulatorServer simulatorServer() throws IOException {
         return SimulatorServer.start(
