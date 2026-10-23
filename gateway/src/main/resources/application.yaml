@@ -10,9 +10,21 @@ spring:
 server:
   shutdown: graceful
 
+lab:
+  connection-mode: shared
+  upstream:
+    target: localhost:50051
+    stream-deadline: 60s
+  shutdown:
+    drain-timeout: 10s
+    channel-termination-timeout: 5s
+
 management:
   endpoint:
     health:
+      group:
+        readiness:
+          include: readinessState,upstreamChannel
       probes:
         enabled: true
   endpoints:
