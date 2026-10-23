@@ -43,6 +43,8 @@ class ConnectionModeConfigTest {
             assertThat(properties.limits().queueWait()).isEqualTo(Duration.ofSeconds(5));
             assertThat(properties.limits().maxWaiting()).isEqualTo(100);
             assertThat(properties.limits().streamQueueCapacity()).isEqualTo(16);
+            assertThat(properties.timeouts().firstChunk()).isEqualTo(Duration.ofSeconds(30));
+            assertThat(properties.timeouts().idleBetweenChunks()).isEqualTo(Duration.ofSeconds(30));
         }
     }
 
@@ -70,6 +72,37 @@ class ConnectionModeConfigTest {
         String property = argument.substring(2, argument.indexOf('='));
         assertThatThrownBy(() -> builder().run(argument).close())
                 .hasStackTraceContaining(property);
+    }
+
+    @Test
+    void timeoutsAreBoundFromRelaxedNames() {
+        try (ConfigurableApplicationContext context = builder().run("--lab.timeouts.first-chunk=2s",
+                "--lab.timeouts.idleBetweenChunks=1500ms")) {
+            GatewayProperties.Timeouts timeouts = context.getBean(GatewayProperties.class).timeouts();
+            assertThat(timeouts.firstChunk()).isEqualTo(Duration.ofSeconds(2));
+            assertThat(timeouts.idleBetweenChunks()).isEqualTo(Duration.ofMillis(1500));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "--lab.timeouts.first-chunk=0s",
+            "--lab.timeouts.first-chunk=-1s",
+            "--lab.timeouts.idle-between-chunks=0s",
+            "--lab.timeouts.first-chunk=60s",
+            "--lab.timeouts.idle-between-chunks=61s"})
+    void invalidTimeoutsFailAtStartup(String argument) {
+        String property = argument.substring(2, argument.indexOf('='));
+        assertThatThrownBy(() -> builder().run(argument).close())
+                .hasStackTraceContaining(property);
+    }
+
+    @Test
+    void timeoutNotShorterThanDeadlineFailsAtStartup() {
+        // The default 30s timeouts no longer fit under a 10s call deadline.
+        assertThatThrownBy(() -> builder().run("--lab.upstream.stream-deadline=10s").close())
+                .hasStackTraceContaining("lab.timeouts.first-chunk")
+                .hasStackTraceContaining("lab.upstream.stream-deadline");
     }
 
     @Test

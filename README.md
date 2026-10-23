@@ -6,8 +6,8 @@ Everything is synthetic: no real LLM, no API key.
 
 > Status: **stage 1 in progress.** The gRPC contract, the synthetic simulator
 > and the gateway's shared-channel SSE bridge with bounded resources (active
-> stream limit, per-stream queue, metrics) are done and tested. The load
-> generator is a skeleton.
+> stream limit, per-stream queue, metrics) and upstream timeouts with
+> cancellation checks are done and tested. The load generator is a skeleton.
 
 ## Problem
 
@@ -32,7 +32,7 @@ Chat UI, user accounts, RAG, vector databases, multi-cloud, Kubernetes.
 |---|---|---|
 | `proto/` | `TokenStreamService` and `SimulatorAdminService` contract | done |
 | `simulator/` | Synthetic gRPC token producer with timing and fault injection | done |
-| `gateway/` | Spring Boot SSE gateway: lifecycle, bounded queue, gRPC adapter | shared channel + SSE bridge + bounded resources (limit, per-stream queue, metrics) done |
+| `gateway/` | Spring Boot SSE gateway: lifecycle, bounded queue, gRPC adapter | shared channel + SSE bridge + bounded resources (limit, per-stream queue, metrics) + first-chunk/idle timeouts and upstream-cancel checks done |
 | `loadgen/` | Closed- and open-model load generator (HdrHistogram) | skeleton |
 
 ## Simulator
@@ -110,7 +110,8 @@ an `X-Request-Id` header.
 | `error` | `{"requestId","code","message"}` where `code` is a gRPC status code |
 
 Every stream ends with exactly one `complete` or `error` event, except when the
-client disconnected or stopped reading (see "Known limits"). Readiness
+client disconnected or stopped reading (see "Known limits"). A timeout ends the
+stream with an `error` event (see "Timeouts and cancellation"). Readiness
 (`/actuator/health/readiness`) includes the upstream channel and is DOWN while it
 is not READY; liveness is unaffected. On shutdown the gateway answers new
 streams with 503 + `Retry-After`, drains active streams, force-cancels the rest
@@ -122,8 +123,8 @@ Three bounds apply to every gateway instance.
 
 **Active stream limit.** `lab.limits.max-active-streams` caps the streams that hold
 a *permit*. A stream takes a permit when it is admitted and gives it back as soon as
-its terminal outcome is claimed (completed, upstream error, client gone, shutdown),
-before the last event is written. When no permit is free, `lab.limits.overload-policy`
+its terminal outcome is claimed (completed, upstream error, client gone, shutdown,
+timeout, queue overflow), before the last event is written. When no permit is free, `lab.limits.overload-policy`
 decides:
 
 | Policy | Behaviour |
@@ -166,10 +167,48 @@ thread per stream, never on the gRPC callback thread.
 | `queue_depth{queue="chunks"}` | gauge: chunks queued across all streams |
 | `queue_depth{queue="admission"}` | gauge: requests waiting for a permit |
 | `rejected_total{reason}` | counter, reasons above |
+| `timeouts_total{kind}` | counter: streams ended by a timeout, `kind` = `first_chunk` or `idle` (see "Timeouts and cancellation") |
 
 No Prometheus registry is on the classpath; `prometheus` appears in the exposure
 list but has no effect today. How a Prometheus registry would render the
 `rejected_total` name has not been checked.
+
+### Timeouts and cancellation
+
+Two timers bound how long the *upstream* may stay silent. Neither measures a slow
+client.
+
+| Timer | Starts | Is reset by | Armed while |
+|---|---|---|---|
+| first chunk (`lab.timeouts.first-chunk`) | when the upstream call starts, i.e. after admission (waiting for a permit is not counted) | the first chunk received | no chunk has been received |
+| idle (`lab.timeouts.idle-between-chunks`) | at the first chunk received, if credit is still outstanding then | each chunk received from upstream (not written to the client) | the gateway has granted upstream credit that is still unused, and no last chunk or upstream end was received |
+
+When flow control has paused the upstream because the client is slow (credit 0), the
+idle timer is not armed and cannot fire; it is armed again when a credit is handed
+back. When the last chunk or the upstream's `error`/end has been received, no timer
+is armed, so a slow client at the end of a stream cannot turn into a timeout.
+
+When a timer expires the stream takes the same single terminal outcome as every other
+ending: the upstream call is cancelled (with the message `first chunk timeout` or
+`idle timeout between chunks`), the permit and lease are released once, chunks that
+were still queued (not yet written) are dropped, and the client gets one `error`
+event with `code` `DEADLINE_EXCEEDED` and that message. Chunks that were already
+written come before it. The timers run on one shared daemon scheduler thread
+(`stream-timeouts`), which never waits for a client write. Every terminal outcome
+(completed, upstream error, client gone, shutdown, overflow, timeout) cancels the
+stream's timer; the tests check that no timer is left armed afterwards. A deadline
+error from gRPC itself (`lab.upstream.stream-deadline`) is reported with the gRPC
+message instead of the two messages above, which tells the two apart.
+
+`timeouts_total{kind=first_chunk|idle}` counts these endings (registered at startup,
+so it reads 0). Only the outcome's winner counts, so a stream counts at most once.
+
+The tests prove that cancellations reach the upstream by reading the simulator's
+`active_generations` and `cancelled_total` (`SimulatorAdminService.GetStats`) for four
+causes: client disconnect, first chunk timeout, idle timeout and shutdown. A stream
+that nobody cancels stays at `active_generations == 1`. Timers keep running while
+shutdown drains, so a stream the upstream no longer answers can end with a timeout
+(`DEADLINE_EXCEEDED`) instead of the forced shutdown cancel (`CANCELLED`).
 
 Known limits of the gateway:
 
@@ -182,9 +221,13 @@ Known limits of the gateway:
   already claimed.
 - A stuck write of an *intermediate* chunk is different: no outcome is claimed, and the
   upstream's `error` or deadline signal waits behind it in the queue. The stream
-  therefore keeps its permit until the write returns, shutdown cancels it, or the
-  emitter timeout (stream deadline + 5 s) ends it. That the emitter timeout callback
-  runs while another thread is blocked in a write is a hypothesis; no test covers it.
+  therefore keeps its permit until one of these happens: the write returns; shutdown
+  cancels it; the idle timeout fires (only while upstream credit is outstanding and
+  upstream stays silent: the timeout claims the stream and frees its permit even
+  though the write is still stuck, but not once credit is exhausted, the last chunk
+  has been received, or upstream has ended); or the emitter timeout (stream deadline + 5 s) ends it. That the emitter
+  timeout callback runs while another thread is blocked in a write is a hypothesis;
+  no test covers it.
   This is not new (a stuck write already blocked delivery of upstream callbacks), but
   now the blocked thread is the stream's own drainer and the upstream pauses by flow
   control. Until then the stream counts against `max-active-streams`.
@@ -207,6 +250,23 @@ Known limits of the gateway:
   has begun, shutdown no longer cancels the stream: it ends with `complete` if the
   write succeeds, or is freed as a client disconnect (no `complete` event) if the
   write fails. Nothing is ever sent after a terminal event.
+- The timers do not detect a stuck client write. They measure upstream silence only,
+  and the idle timer stops when credit runs out. The stuck-intermediate-write case
+  above therefore holds its permit until the write returns, shutdown, the emitter
+  timeout, or an idle timeout while upstream credit is still outstanding and upstream
+  is silent (not after the last chunk has been received or upstream has ended).
+- The emitter `onTimeout` hypothesis above is unchanged: it stays a hypothesis.
+- A chunk that arrives at the very instant a timer fires can lose the race: the
+  timeout wins and the chunk is dropped.
+- All timers share one scheduler thread: a timer never fires earlier than configured,
+  but under heavy load it can fire late.
+- A stream whose upstream stays silent while it still holds credit (for example `HANG`)
+  and whose client is gone ends at the latest with the timeout. Whether Tomcat notices
+  the disconnect without a write has not been verified; the disconnect test uses a
+  continuously streaming upstream.
+- Both timeouts must be shorter than `lab.upstream.stream-deadline`: lowering the
+  deadline below 30 s means lowering both timeouts too, or the application does not
+  start.
 - With a per-request connection mode (not implemented) the lease would have to be
   acquired after admission, not before as it is now with the no-op shared lease.
 
@@ -222,6 +282,8 @@ Known limits of the gateway:
 | `lab.limits.queue-wait` | `5s` (positive; used by `wait`) |
 | `lab.limits.max-waiting` | `100` (>= 1; used by `wait`) |
 | `lab.limits.stream-queue-capacity` | `16` (1..4096) |
+| `lab.timeouts.first-chunk` | `30s` (positive, shorter than `lab.upstream.stream-deadline`) |
+| `lab.timeouts.idle-between-chunks` | `30s` (positive, shorter than `lab.upstream.stream-deadline`) |
 
 Invalid values stop the application at startup with a message naming the property.
 

@@ -43,11 +43,15 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  * its capacity. The upstream end (error/complete) is handled after the queue drained,
  * so queued chunks always precede it. {@link #finish} removes the stream from the
  * registry's tracked set after the last write.
+ *
+ * <p>A {@link StreamTimer} bounds upstream silence (first chunk, then idle between chunks while
+ * upstream holds credit). Its expiry is just another terminal claim ({@link #timedOut}); every
+ * claim goes through {@link #claim} so the timer is closed on every terminal path.
  */
 final class StreamBridge implements ClientResponseObserver<GenerateRequest, TokenChunk> {
 
     enum StreamOutcome {
-        COMPLETED, UPSTREAM_ERROR, CLIENT_GONE, SHUTDOWN_CANCELLED
+        COMPLETED, UPSTREAM_ERROR, CLIENT_GONE, SHUTDOWN_CANCELLED, FIRST_CHUNK_TIMEOUT, IDLE_TIMEOUT
     }
 
     private static final Logger LOGGER = System.getLogger(StreamBridge.class.getName());
@@ -66,6 +70,7 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
     private final ChannelProvider.Lease lease;
     private final int queueCapacity;
     private final StreamMetrics metrics;
+    private final StreamTimer timer;
     private final ArrayBlockingQueue<TokenChunk> queue;
     private final AtomicInteger wip = new AtomicInteger();
 
@@ -79,13 +84,14 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
     private int sentChunks;
 
     StreamBridge(String requestId, SseEmitter emitter, ActiveStreamRegistry registry, ChannelProvider.Lease lease,
-            int queueCapacity, StreamMetrics metrics) {
+            int queueCapacity, StreamMetrics metrics, StreamTimeouts timeouts) {
         this.requestId = requestId;
         this.emitter = emitter;
         this.registry = registry;
         this.lease = lease;
         this.queueCapacity = queueCapacity;
         this.metrics = metrics;
+        this.timer = new StreamTimer(timeouts, this::timedOut);
         this.queue = new ArrayBlockingQueue<>(queueCapacity);
         // A container-side end of the response before our terminal event means the client is gone.
         // These callbacks only use the atomic claim, so they cannot block on a stuck write.
@@ -106,6 +112,9 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
         if (outcome != null) {
             stream.cancel(cancelMessage(outcome), null);
         }
+        // Called by the stub right before call.start, i.e. after admission: the first-chunk limit
+        // measures upstream time to first token only. A claimed stream has a closed timer.
+        timer.start(queueCapacity);
     }
 
     /** gRPC callback thread: only enqueues, never writes and never blocks. */
@@ -114,6 +123,8 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
         if (terminal.get() != null) {
             return;
         }
+        // A chunk received (not written) resets the idle timer: the limits measure upstream silence.
+        timer.chunkReceived(chunk.getLast());
         // Count before offering: the drainer may poll the chunk (and count it out) before this
         // thread continues, which would let queue_depth dip below zero for an instant.
         metrics.chunkQueued();
@@ -132,6 +143,7 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
         if (upstreamEnd == null) {
             upstreamEnd = Status.fromThrowable(t);
         }
+        timer.upstreamEnded();
         scheduleDrain();
     }
 
@@ -140,6 +152,7 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
         if (upstreamEnd == null) {
             upstreamEnd = Status.OK;
         }
+        timer.upstreamEnded();
         scheduleDrain();
     }
 
@@ -202,6 +215,8 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
         if (requestMore && terminal.get() == null) {
             ClientCallStreamObserver<GenerateRequest> stream = requestStream;
             if (stream != null) {
+                // Before request(1): the onNext that credit enables is always counted after it.
+                timer.creditGranted();
                 stream.request(1);
             }
         }
@@ -219,7 +234,7 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
             // lastSeen is set before the claim on purpose: if the claim is lost, a terminal
             // outcome already exists and the upstream end is a no-op either way.
             lastSeen = true;
-            if (!terminal.compareAndSet(null, StreamOutcome.COMPLETED)) {
+            if (!claim(StreamOutcome.COMPLETED)) {
                 return false;
             }
             // The claim winner frees capacity before any write, so a stuck write cannot leak it.
@@ -271,7 +286,7 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
             code = status.getCode().name();
             message = status.getDescription() == null ? "" : status.getDescription();
         }
-        if (terminal.compareAndSet(null, StreamOutcome.UPSTREAM_ERROR)) {
+        if (claim(StreamOutcome.UPSTREAM_ERROR)) {
             releaseCapacity();
             sendErrorAndComplete(code, message);
             finish(StreamOutcome.UPSTREAM_ERROR);
@@ -280,7 +295,7 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
 
     /** gRPC thread: upstream violated its credit. One error, upstream cancelled, queue dropped. */
     private void overflow() {
-        if (!terminal.compareAndSet(null, StreamOutcome.UPSTREAM_ERROR)) {
+        if (!claim(StreamOutcome.UPSTREAM_ERROR)) {
             return;
         }
         cancelUpstream("per-request queue overflow");
@@ -299,7 +314,7 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
      * when the terminal event has been written (or given up on).
      */
     CompletableFuture<Void> cancelForShutdown() {
-        if (!terminal.compareAndSet(null, StreamOutcome.SHUTDOWN_CANCELLED)) {
+        if (!claim(StreamOutcome.SHUTDOWN_CANCELLED)) {
             return CompletableFuture.completedFuture(null);
         }
         cancelUpstream(StreamOutcome.SHUTDOWN_CANCELLED);
@@ -311,8 +326,38 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
                 TERMINAL_EVENT_EXECUTOR);
     }
 
+    /**
+     * Timer thread, holds no lock. Same shape as {@link #overflow()}: the claim winner cancels
+     * upstream and frees capacity before anything is written; the error goes out on another
+     * thread so a stuck client write never blocks the shared scheduler.
+     */
+    private void timedOut(TimeoutKind kind) {
+        if (!claim(kind.outcome())) {
+            return;
+        }
+        cancelUpstream(kind.message());
+        releaseCapacity();
+        metrics.timedOut(kind);
+        discardQueued();
+        TERMINAL_EVENT_EXECUTOR.execute(() -> {
+            sendErrorAndComplete(Status.Code.DEADLINE_EXCEEDED.name(), kind.message());
+            finish(kind.outcome());
+        });
+        // A chunk offered after the discard above is dropped by the drainer.
+        scheduleDrain();
+    }
+
+    /** The only place that claims the terminal outcome; closing the timer here leaves no path that leaks it. */
+    private boolean claim(StreamOutcome outcome) {
+        if (terminal.compareAndSet(null, outcome)) {
+            timer.close();
+            return true;
+        }
+        return false;
+    }
+
     private void clientGone() {
-        if (terminal.compareAndSet(null, StreamOutcome.CLIENT_GONE)) {
+        if (claim(StreamOutcome.CLIENT_GONE)) {
             cancelUpstream(StreamOutcome.CLIENT_GONE);
             releaseCapacity();
             finish(StreamOutcome.CLIENT_GONE);
@@ -395,7 +440,17 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
         LOGGER.log(Level.INFO, "Stream {0} finished: {1}", requestId, outcome);
     }
 
+    /** Whether a timeout timer is armed (tests). */
+    boolean timerArmed() {
+        return timer.isArmed();
+    }
+
     private static String cancelMessage(StreamOutcome outcome) {
-        return outcome == StreamOutcome.SHUTDOWN_CANCELLED ? SHUTDOWN_MESSAGE : "client disconnected";
+        return switch (outcome) {
+            case SHUTDOWN_CANCELLED -> SHUTDOWN_MESSAGE;
+            case FIRST_CHUNK_TIMEOUT -> TimeoutKind.FIRST_CHUNK.message();
+            case IDLE_TIMEOUT -> TimeoutKind.IDLE.message();
+            case COMPLETED, UPSTREAM_ERROR, CLIENT_GONE -> "client disconnected";
+        };
     }
 }

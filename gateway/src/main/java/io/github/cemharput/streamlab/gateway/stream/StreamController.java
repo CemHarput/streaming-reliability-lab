@@ -26,13 +26,15 @@ public class StreamController {
     private final ActiveStreamRegistry registry;
     private final Duration streamDeadline;
     private final StreamMetrics metrics;
+    private final StreamTimeouts timeouts;
     private final int streamQueueCapacity;
 
     public StreamController(ChannelProvider channels, ActiveStreamRegistry registry, StreamMetrics metrics,
-            GatewayProperties properties) {
+            StreamTimeouts timeouts, GatewayProperties properties) {
         this.channels = channels;
         this.registry = registry;
         this.metrics = metrics;
+        this.timeouts = timeouts;
         this.streamQueueCapacity = properties.limits().streamQueueCapacity();
         this.streamDeadline = properties.upstream().streamDeadline();
     }
@@ -61,7 +63,7 @@ public class StreamController {
         }
 
         SseEmitter emitter = new SseEmitter(streamDeadline.toMillis() + EMITTER_TIMEOUT_MARGIN_MS);
-        StreamBridge bridge = new StreamBridge(requestId, emitter, registry, lease, streamQueueCapacity, metrics);
+        StreamBridge bridge = new StreamBridge(requestId, emitter, registry, lease, streamQueueCapacity, metrics, timeouts);
         ActiveStreamRegistry.Admission admission = registry.admit(bridge);
         if (admission != ActiveStreamRegistry.Admission.ADMITTED) {
             lease.close();

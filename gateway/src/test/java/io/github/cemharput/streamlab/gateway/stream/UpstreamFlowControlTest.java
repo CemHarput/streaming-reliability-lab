@@ -99,4 +99,50 @@ class UpstreamFlowControlTest {
             emitter.gate.countDown();
         }
     }
+
+    @Test
+    void stalledClientDoesNotTriggerIdleTimeout() {
+        int capacity = 4;
+        int chunks = 50;
+        ActiveStreamRegistry registry = startedRegistry(Duration.ofSeconds(1));
+        SimpleMeterRegistry meters = new SimpleMeterRegistry();
+        StreamTimeouts timeouts = StreamTestSupport.startedTimeouts(Duration.ofMillis(500), Duration.ofMillis(500));
+        RecordingEmitter emitter = RecordingEmitter.stalled();
+        StreamBridge bridge = StreamTestSupport.newBridge(emitter, registry, NO_LEASE, capacity,
+                new StreamMetrics(meters, registry), timeouts);
+        assertThat(registry.tryRegister(bridge)).isTrue();
+        GenerateRequest request = GenerateRequest.newBuilder()
+                .setRequestId("r-idle")
+                .setSeed(42)
+                .setProfile(StreamProfile.newBuilder().setChunkCount(chunks).setFirstChunkDelayMs(1).setChunkIntervalMs(1))
+                .build();
+        try {
+            TokenStreamServiceGrpc.newStub(channel)
+                    .withDeadlineAfter(30, TimeUnit.SECONDS)
+                    .generateTokens(request, bridge);
+
+            // Credit is used up and the client reads nothing: upstream is paused, not silent.
+            await().atMost(TIMEOUT).until(() -> stats().getFlowControlPausesTotal() >= 1);
+            await().during(Duration.ofMillis(1500)).atMost(TIMEOUT).untilAsserted(() -> {
+                assertThat(stats().getActiveGenerations()).isEqualTo(1);
+                assertThat(meters.get("timeouts_total").tag("kind", "idle").counter().count()).isZero();
+                assertThat(meters.get("timeouts_total").tag("kind", "first_chunk").counter().count()).isZero();
+                assertThat(registry.activeCount()).isEqualTo(1);
+                assertThat(bridge.timerArmed()).isFalse();
+            });
+
+            emitter.gate.countDown();
+
+            await().atMost(TIMEOUT).until(() -> emitter.completed);
+            assertThat(emitter.events).hasSize(chunks + 1);
+            assertThat(emitter.events.get(chunks)).contains("event:complete");
+            await().atMost(TIMEOUT).until(() -> stats().getActiveGenerations() == 0);
+            await().atMost(TIMEOUT).until(() -> registry.activeCount() == 0);
+            assertThat(timeouts.pendingTimers()).isZero();
+            assertThat(meters.get("timeouts_total").tag("kind", "idle").counter().count()).isZero();
+        } finally {
+            emitter.gate.countDown();
+            timeouts.stop();
+        }
+    }
 }

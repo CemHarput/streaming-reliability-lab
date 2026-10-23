@@ -9,7 +9,16 @@ public record GatewayProperties(
         @DefaultValue("shared") ConnectionMode connectionMode,
         @DefaultValue Upstream upstream,
         @DefaultValue Shutdown shutdown,
-        @DefaultValue Limits limits) {
+        @DefaultValue Limits limits,
+        @DefaultValue Timeouts timeouts) {
+
+    public GatewayProperties {
+        if (upstream != null && timeouts != null) {
+            requireShorterThanDeadline(timeouts.firstChunk(), "lab.timeouts.first-chunk", upstream.streamDeadline());
+            requireShorterThanDeadline(timeouts.idleBetweenChunks(), "lab.timeouts.idle-between-chunks",
+                    upstream.streamDeadline());
+        }
+    }
 
     /** Only the shared mode exists in this feature; per-request arrives later. */
     public enum ConnectionMode {
@@ -71,6 +80,28 @@ public record GatewayProperties(
 
         public static Limits defaults() {
             return new Limits(100, OverloadPolicy.REJECT, Duration.ofSeconds(5), 100, 16);
+        }
+    }
+
+    /** Upstream silence limits; both must stay below the call deadline or they could never fire. */
+    public record Timeouts(
+            @DefaultValue("30s") Duration firstChunk,
+            @DefaultValue("30s") Duration idleBetweenChunks) {
+
+        public Timeouts {
+            requirePositive(firstChunk, "lab.timeouts.first-chunk");
+            requirePositive(idleBetweenChunks, "lab.timeouts.idle-between-chunks");
+        }
+
+        public static Timeouts defaults() {
+            return new Timeouts(Duration.ofSeconds(30), Duration.ofSeconds(30));
+        }
+    }
+
+    private static void requireShorterThanDeadline(Duration value, String name, Duration deadline) {
+        if (value != null && deadline != null && value.compareTo(deadline) >= 0) {
+            throw new IllegalArgumentException(name + " (" + value + ") must be shorter than "
+                    + "lab.upstream.stream-deadline (" + deadline + ")");
         }
     }
 

@@ -4,6 +4,10 @@ import io.github.cemharput.streamlab.gateway.upstream.ManagedChannelFactory;
 import io.github.cemharput.streamlab.simulator.RequestLimits;
 import io.github.cemharput.streamlab.simulator.SimulatorConfig;
 import io.github.cemharput.streamlab.simulator.SimulatorServer;
+import io.github.cemharput.streamlab.tokenstream.v1.GetStatsRequest;
+import io.github.cemharput.streamlab.tokenstream.v1.SimulatorAdminServiceGrpc;
+import io.github.cemharput.streamlab.tokenstream.v1.SimulatorStats;
+import io.grpc.ManagedChannel;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import java.io.IOException;
@@ -24,6 +28,16 @@ public class InProcessSimulatorConfig {
     /** The in-process server name, so tests can open their own channel to the simulator (e.g. for its stats). */
     public String serverName() {
         return name;
+    }
+
+    /** The simulator's own counters, read over a fresh in-process channel (proves what reached the upstream). */
+    public SimulatorStats stats() {
+        ManagedChannel channel = InProcessChannelBuilder.forName(name).build();
+        try {
+            return SimulatorAdminServiceGrpc.newBlockingStub(channel).getStats(GetStatsRequest.getDefaultInstance());
+        } finally {
+            channel.shutdownNow();
+        }
     }
 
     @Bean(destroyMethod = "stop")

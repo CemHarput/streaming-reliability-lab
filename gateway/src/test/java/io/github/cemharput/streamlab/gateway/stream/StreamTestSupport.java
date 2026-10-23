@@ -5,6 +5,7 @@ import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Connection
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Shutdown;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Limits;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.OverloadPolicy;
+import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Timeouts;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Upstream;
 import io.github.cemharput.streamlab.gateway.upstream.ChannelProvider;
 import io.github.cemharput.streamlab.tokenstream.v1.GenerateRequest;
@@ -34,13 +35,36 @@ final class StreamTestSupport {
     }
 
     static ActiveStreamRegistry startedRegistry(Duration drainTimeout, Limits limits) {
-        ActiveStreamRegistry registry = new ActiveStreamRegistry(new GatewayProperties(
+        ActiveStreamRegistry registry = new ActiveStreamRegistry(properties(drainTimeout, limits, Timeouts.defaults()));
+        registry.start();
+        return registry;
+    }
+
+    static GatewayProperties properties(Duration drainTimeout, Limits limits, Timeouts timeouts) {
+        return new GatewayProperties(
                 ConnectionMode.SHARED,
                 new Upstream("localhost:1", Duration.ofSeconds(60)),
                 new Shutdown(drainTimeout, Duration.ofSeconds(1)),
-                limits));
-        registry.start();
-        return registry;
+                limits,
+                timeouts);
+    }
+
+    /** A started scheduler with the given limits; the caller must stop it. */
+    static StreamTimeouts startedTimeouts(Duration firstChunk, Duration idleBetweenChunks) {
+        StreamTimeouts timeouts = new StreamTimeouts(
+                properties(Duration.ofSeconds(1), defaultLimits(), new Timeouts(firstChunk, idleBetweenChunks)));
+        timeouts.start();
+        return timeouts;
+    }
+
+    private static StreamTimeouts longTimeouts;
+
+    /** Shared 30s/30s scheduler for tests that do not care about timeouts (daemon thread, never fires in time). */
+    private static synchronized StreamTimeouts longTimeouts() {
+        if (longTimeouts == null) {
+            longTimeouts = startedTimeouts(Duration.ofSeconds(30), Duration.ofSeconds(30));
+        }
+        return longTimeouts;
     }
 
     static Limits defaultLimits() {
@@ -66,7 +90,12 @@ final class StreamTestSupport {
 
     static StreamBridge newBridge(SseEmitter emitter, ActiveStreamRegistry registry, ChannelProvider.Lease lease,
             int capacity, StreamMetrics metrics) {
-        return new StreamBridge("r", emitter, registry, lease, capacity, metrics);
+        return newBridge(emitter, registry, lease, capacity, metrics, longTimeouts());
+    }
+
+    static StreamBridge newBridge(SseEmitter emitter, ActiveStreamRegistry registry, ChannelProvider.Lease lease,
+            int capacity, StreamMetrics metrics, StreamTimeouts timeouts) {
+        return new StreamBridge("r", emitter, registry, lease, capacity, metrics, timeouts);
     }
 
     static TokenChunk chunk(int seq, boolean last) {
