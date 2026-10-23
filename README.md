@@ -65,6 +65,11 @@ Requirements: JDK 26.
 ./mvnw verify
 ```
 
+`verify` also measures test coverage with JaCoCo (0.8.15, the first release that supports
+Java 26). Each module with tests writes an HTML report to `<module>/target/site/jacoco/index.html`
+and an XML report to `<module>/target/site/jacoco/jacoco.xml`, which the Sonar step in the CI
+workflow reads. Modules without tests (`proto`, `loadgen` for now) produce no report.
+
 Start the simulator (port `50051`, override with `SIMULATOR_PORT`):
 
 ```bash

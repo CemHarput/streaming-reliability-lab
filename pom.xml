@@ -35,6 +35,10 @@
         <hdrhistogram.version>2.2.2</hdrhistogram.version>
 
         <protobuf-maven-plugin.version>5.1.7</protobuf-maven-plugin.version>
+        <!-- 0.8.15 is the first release with official Java 26 (class file major 70) support. -->
+        <jacoco.version>0.8.15</jacoco.version>
+        <!-- Resolved per module by Maven, so every module hands its own report to the Sonar scanner. -->
+        <sonar.coverage.jacoco.xmlReportPaths>${project.build.directory}/site/jacoco/jacoco.xml</sonar.coverage.jacoco.xmlReportPaths>
         <maven-compiler-plugin.version>3.14.1</maven-compiler-plugin.version>
         <maven-surefire-plugin.version>3.5.4</maven-surefire-plugin.version>
         <maven-jar-plugin.version>3.4.2</maven-jar-plugin.version>
@@ -105,5 +109,31 @@
                 </plugin>
             </plugins>
         </pluginManagement>
+
+        <plugins>
+            <!-- Coverage for every module that has tests: the agent is attached to surefire through the
+                 argLine property, and the XML report lands in target/site/jacoco/jacoco.xml, the path
+                 the Sonar scanner picks up on its own. Modules without tests are skipped by the plugin. -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco.version}</version>
+                <executions>
+                    <execution>
+                        <id>jacoco-prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>jacoco-report</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
     </build>
 </project>
