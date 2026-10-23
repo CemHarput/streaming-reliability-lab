@@ -25,10 +25,17 @@ public class StreamController {
     private final ChannelProvider channels;
     private final ActiveStreamRegistry registry;
     private final Duration streamDeadline;
+    private final StreamMetrics metrics;
+    private final StreamTimeouts timeouts;
+    private final int streamQueueCapacity;
 
-    public StreamController(ChannelProvider channels, ActiveStreamRegistry registry, GatewayProperties properties) {
+    public StreamController(ChannelProvider channels, ActiveStreamRegistry registry, StreamMetrics metrics,
+            StreamTimeouts timeouts, GatewayProperties properties) {
         this.channels = channels;
         this.registry = registry;
+        this.metrics = metrics;
+        this.timeouts = timeouts;
+        this.streamQueueCapacity = properties.limits().streamQueueCapacity();
         this.streamDeadline = properties.upstream().streamDeadline();
     }
 
@@ -51,13 +58,16 @@ public class StreamController {
         try {
             lease = channels.acquire();
         } catch (IllegalStateException ex) {
+            metrics.rejected("upstream_unavailable");
             return unavailable();
         }
 
         SseEmitter emitter = new SseEmitter(streamDeadline.toMillis() + EMITTER_TIMEOUT_MARGIN_MS);
-        StreamBridge bridge = new StreamBridge(requestId, emitter, registry, lease);
-        if (!registry.tryRegister(bridge)) {
+        StreamBridge bridge = new StreamBridge(requestId, emitter, registry, lease, streamQueueCapacity, metrics, timeouts);
+        ActiveStreamRegistry.Admission admission = registry.admit(bridge);
+        if (admission != ActiveStreamRegistry.Admission.ADMITTED) {
             lease.close();
+            metrics.rejected(reason(admission));
             return unavailable();
         }
         try {
@@ -70,6 +80,16 @@ public class StreamController {
         return ResponseEntity.ok()
                 .header(REQUEST_ID_HEADER, requestId)
                 .body(emitter);
+    }
+
+    private static String reason(ActiveStreamRegistry.Admission admission) {
+        return switch (admission) {
+            case REJECTED_LIMIT -> "limit";
+            case REJECTED_QUEUE_TIMEOUT -> "queue_timeout";
+            case REJECTED_SHUTDOWN -> "shutdown";
+            case REJECTED_INTERRUPTED -> "interrupted";
+            case ADMITTED -> throw new IllegalArgumentException("not a rejection");
+        };
     }
 
     private static ResponseEntity<SseEmitter> unavailable() {

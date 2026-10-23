@@ -15,6 +15,15 @@ lab:
   upstream:
     target: localhost:50051
     stream-deadline: 60s
+  limits:
+    max-active-streams: 100
+    overload-policy: reject
+    queue-wait: 5s
+    max-waiting: 100
+    stream-queue-capacity: 16
+  timeouts:
+    first-chunk: 30s
+    idle-between-chunks: 30s
   shutdown:
     drain-timeout: 10s
     channel-termination-timeout: 5s

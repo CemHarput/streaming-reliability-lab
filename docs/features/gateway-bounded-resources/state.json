@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "slug": "gateway-bounded-resources",
+  "status": "implemented",
+  "review": "completed",
+  "created_at": "2026-10-23T16:48:18.920016+00:00",
+  "updated_at": "2026-10-23T17:37:14.237316+00:00",
+  "approved_plan_sha256": "b5527a390d5184086b5589a3ee08fba872619d3c356f64c3b7a873d4914365eb",
+  "baseline_head": "9a0900a3eb5d5051089cb02f6311523ec2d53d80",
+  "approved_at": "2026-10-23T17:00:02.486264+00:00",
+  "reviewed_at": "2026-10-23T17:37:14.237303+00:00"
+}

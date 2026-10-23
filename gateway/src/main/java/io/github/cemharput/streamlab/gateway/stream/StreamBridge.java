@@ -13,9 +13,13 @@ import java.io.IOException;
 import java.lang.System.Logger;
 import java.lang.System.Logger.Level;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import org.springframework.http.MediaType;
@@ -27,20 +31,34 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  *
  * <p>The terminal outcome is claimed with a compare-and-set, never under a lock
  * that a blocking client write can hold. The winner cancels upstream and frees
- * its registry slot immediately; only the terminal SSE event is written under
- * {@link #sendLock}, which keeps events ordered (nothing is sent after the
- * terminal event). A client that stopped reading therefore delays at most its
- * own terminal event, never shutdown or upstream cancellation.
+ * its permit and lease immediately ({@link #releaseCapacity()}); only the terminal
+ * SSE event is written under {@link #sendLock}, which keeps events ordered (nothing
+ * is sent after the terminal event). A client that stopped reading therefore delays
+ * at most its own terminal event, never shutdown, upstream cancellation or capacity.
+ *
+ * <p>Upstream chunks go into a bounded per-stream queue ({@code offer} only, the gRPC
+ * thread never blocks) and a serial virtual-thread drainer writes them to the client.
+ * Upstream flow control is manual: the initial credit equals the queue capacity and one
+ * credit is returned after each chunk the client accepted, so the queue cannot exceed
+ * its capacity. The upstream end (error/complete) is handled after the queue drained,
+ * so queued chunks always precede it. {@link #finish} removes the stream from the
+ * registry's tracked set after the last write.
+ *
+ * <p>A {@link StreamTimer} bounds upstream silence (first chunk, then idle between chunks while
+ * upstream holds credit). Its expiry is just another terminal claim ({@link #timedOut}); every
+ * claim goes through {@link #claim} so the timer is closed on every terminal path.
  */
 final class StreamBridge implements ClientResponseObserver<GenerateRequest, TokenChunk> {
 
     enum StreamOutcome {
-        COMPLETED, UPSTREAM_ERROR, CLIENT_GONE, SHUTDOWN_CANCELLED
+        COMPLETED, UPSTREAM_ERROR, CLIENT_GONE, SHUTDOWN_CANCELLED, FIRST_CHUNK_TIMEOUT, IDLE_TIMEOUT
     }
 
     private static final Logger LOGGER = System.getLogger(StreamBridge.class.getName());
     private static final Executor TERMINAL_EVENT_EXECUTOR =
             command -> Thread.ofVirtual().name("stream-terminal-event").start(command);
+    private static final Executor DRAIN_EXECUTOR =
+            command -> Thread.ofVirtual().name("stream-drain").start(command);
 
     static final String SHUTDOWN_MESSAGE = "gateway shutting down";
     /** How long a terminal event waits for a client write that is stuck in progress. */
@@ -50,19 +68,31 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
     private final SseEmitter emitter;
     private final ActiveStreamRegistry registry;
     private final ChannelProvider.Lease lease;
+    private final int queueCapacity;
+    private final StreamMetrics metrics;
+    private final StreamTimer timer;
+    private final ArrayBlockingQueue<TokenChunk> queue;
+    private final AtomicInteger wip = new AtomicInteger();
 
     private final ReentrantLock sendLock = new ReentrantLock();
     private final AtomicReference<StreamOutcome> terminal = new AtomicReference<>();
     private volatile ClientCallStreamObserver<GenerateRequest> requestStream;
     private volatile boolean lastSeen;
-    // gRPC delivers onNext serially, so only that callback touches this.
+    /** Set by the serial gRPC callbacks after every offer; OK means onCompleted. */
+    private volatile Status upstreamEnd;
+    // Only the drainer touches this (happens-before via the wip counter).
     private int sentChunks;
 
-    StreamBridge(String requestId, SseEmitter emitter, ActiveStreamRegistry registry, ChannelProvider.Lease lease) {
+    StreamBridge(String requestId, SseEmitter emitter, ActiveStreamRegistry registry, ChannelProvider.Lease lease,
+            int queueCapacity, StreamMetrics metrics, StreamTimeouts timeouts) {
         this.requestId = requestId;
         this.emitter = emitter;
         this.registry = registry;
         this.lease = lease;
+        this.queueCapacity = queueCapacity;
+        this.metrics = metrics;
+        this.timer = new StreamTimer(timeouts, this::timedOut);
+        this.queue = new ArrayBlockingQueue<>(queueCapacity);
         // A container-side end of the response before our terminal event means the client is gone.
         // These callbacks only use the atomic claim, so they cannot block on a stuck write.
         emitter.onCompletion(this::clientGone);
@@ -73,82 +103,209 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
     @Override
     public void beforeStart(ClientCallStreamObserver<GenerateRequest> stream) {
         requestStream = stream;
+        // Manual flow control: upstream may have at most `queueCapacity` chunks outstanding;
+        // every chunk written to the client hands one credit back (see writeChunk).
+        stream.disableAutoRequestWithInitial(queueCapacity);
         // Publish the stream before reading the outcome: a concurrent claim either
         // sees the stream and cancels it, or is seen here.
         StreamOutcome outcome = terminal.get();
         if (outcome != null) {
             stream.cancel(cancelMessage(outcome), null);
         }
+        // Called by the stub right before call.start, i.e. after admission: the first-chunk limit
+        // measures upstream time to first token only. A claimed stream has a closed timer.
+        timer.start(queueCapacity);
     }
 
+    /** gRPC callback thread: only enqueues, never writes and never blocks. */
     @Override
     public void onNext(TokenChunk chunk) {
-        sendLock.lock();
-        try {
-            if (terminal.get() != null) {
-                return;
-            }
-            boolean last = chunk.getLast();
-            if (last) {
-                // Claim COMPLETED before the final chunk is written: a concurrent shutdown
-                // then cannot cancel a stream whose last data the client has already received.
-                // lastSeen is set before the claim on purpose: if the claim is lost, a terminal
-                // outcome already exists and onCompleted() is a no-op either way.
-                lastSeen = true;
-                if (!terminal.compareAndSet(null, StreamOutcome.COMPLETED)) {
-                    return;
-                }
-            }
-            try {
-                emitter.send(SseEmitter.event()
-                        .name(SseEvents.CHUNK)
-                        .id(Integer.toString(chunk.getSeq()))
-                        .data(new ChunkEvent(requestId, chunk.getSeq(), chunk.getText(), last),
-                                MediaType.APPLICATION_JSON));
-                sentChunks++;
-            } catch (IOException | IllegalStateException ex) {
-                if (last) {
-                    // The upstream call is already complete; only the slot is left to free.
-                    terminal.set(StreamOutcome.CLIENT_GONE);
-                    release(StreamOutcome.CLIENT_GONE);
-                } else {
-                    clientGone();
-                }
-                return;
-            }
-            if (!last) {
-                return;
-            }
-            try {
-                emitter.send(SseEmitter.event()
-                        .name(SseEvents.COMPLETE)
-                        .data(new CompleteEvent(requestId, sentChunks), MediaType.APPLICATION_JSON));
-            } catch (IOException | IllegalStateException ex) {
-                LOGGER.log(Level.DEBUG, "client left before complete event of {0}", requestId);
-            }
-            completeEmitter();
-            release(StreamOutcome.COMPLETED);
-        } finally {
-            sendLock.unlock();
+        if (terminal.get() != null) {
+            return;
         }
+        // A chunk received (not written) resets the idle timer: the limits measure upstream silence.
+        timer.chunkReceived(chunk.getLast());
+        // Count before offering: the drainer may poll the chunk (and count it out) before this
+        // thread continues, which would let queue_depth dip below zero for an instant.
+        metrics.chunkQueued();
+        if (!queue.offer(chunk)) {
+            metrics.chunkDequeued();
+            // Upstream sent more than the credit it was granted.
+            overflow();
+            return;
+        }
+        scheduleDrain();
     }
 
+    /** The end is handled by the drainer after the queued chunks, so they are written first. */
     @Override
     public void onError(Throwable t) {
-        Status status = Status.fromThrowable(t);
-        if (terminal.compareAndSet(null, StreamOutcome.UPSTREAM_ERROR)) {
-            sendErrorAndComplete(status.getCode().name(), status.getDescription() == null ? "" : status.getDescription());
-            release(StreamOutcome.UPSTREAM_ERROR);
+        if (upstreamEnd == null) {
+            upstreamEnd = Status.fromThrowable(t);
         }
+        timer.upstreamEnded();
+        scheduleDrain();
     }
 
     @Override
     public void onCompleted() {
-        if (lastSeen || !terminal.compareAndSet(null, StreamOutcome.UPSTREAM_ERROR)) {
+        if (upstreamEnd == null) {
+            upstreamEnd = Status.OK;
+        }
+        timer.upstreamEnded();
+        scheduleDrain();
+    }
+
+    private void scheduleDrain() {
+        if (wip.getAndIncrement() == 0) {
+            DRAIN_EXECUTOR.execute(this::drainLoop);
+        }
+    }
+
+    /** At most one drain loop per stream runs at a time (wip counter); no thread is held while idle. */
+    private void drainLoop() {
+        int missed = 1;
+        do {
+            try {
+                drainOnce();
+            } catch (RuntimeException ex) {
+                LOGGER.log(Level.ERROR, "drain of " + requestId + " failed", ex);
+            }
+            missed = wip.addAndGet(-missed);
+        } while (missed != 0);
+    }
+
+    private void drainOnce() {
+        while (true) {
+            if (terminal.get() != null) {
+                discardQueued();
+                return;
+            }
+            // Read the end first: it is set after every offer, so an empty queue then means drained.
+            Status end = upstreamEnd;
+            TokenChunk chunk = queue.poll();
+            if (chunk != null) {
+                metrics.chunkDequeued();
+                writeChunk(chunk);
+                continue;
+            }
+            if (end != null) {
+                handleUpstreamEnd(end);
+            }
             return;
         }
-        sendErrorAndComplete(Status.Code.INTERNAL.name(), "upstream ended without last chunk");
-        release(StreamOutcome.UPSTREAM_ERROR);
+    }
+
+    /** Safe from any thread (also while the drainer is stuck in a write); each chunk is removed once. */
+    private void discardQueued() {
+        List<TokenChunk> dropped = new ArrayList<>();
+        queue.drainTo(dropped);
+        metrics.chunksDiscarded(dropped.size());
+    }
+
+    private void writeChunk(TokenChunk chunk) {
+        boolean requestMore;
+        sendLock.lock();
+        try {
+            requestMore = writeChunkLocked(chunk);
+        } finally {
+            sendLock.unlock();
+        }
+        // Outside the lock: hand one credit back after a successful write.
+        if (requestMore && terminal.get() == null) {
+            ClientCallStreamObserver<GenerateRequest> stream = requestStream;
+            if (stream != null) {
+                // Before request(1): the onNext that credit enables is always counted after it.
+                timer.creditGranted();
+                stream.request(1);
+            }
+        }
+    }
+
+    /** Must hold {@link #sendLock}. Returns true when a non-final chunk was written successfully. */
+    private boolean writeChunkLocked(TokenChunk chunk) {
+        if (terminal.get() != null) {
+            return false;
+        }
+        boolean last = chunk.getLast();
+        if (last) {
+            // Claim COMPLETED before the final chunk is written: a concurrent shutdown
+            // then cannot cancel a stream whose last data the client has already received.
+            // lastSeen is set before the claim on purpose: if the claim is lost, a terminal
+            // outcome already exists and the upstream end is a no-op either way.
+            lastSeen = true;
+            if (!claim(StreamOutcome.COMPLETED)) {
+                return false;
+            }
+            // The claim winner frees capacity before any write, so a stuck write cannot leak it.
+            releaseCapacity();
+        }
+        try {
+            emitter.send(SseEmitter.event()
+                    .name(SseEvents.CHUNK)
+                    .id(Integer.toString(chunk.getSeq()))
+                    .data(new ChunkEvent(requestId, chunk.getSeq(), chunk.getText(), last),
+                            MediaType.APPLICATION_JSON));
+            sentChunks++;
+        } catch (IOException | IllegalStateException ex) {
+            if (last) {
+                // The upstream call is already complete and capacity is already released.
+                terminal.set(StreamOutcome.CLIENT_GONE);
+                finish(StreamOutcome.CLIENT_GONE);
+            } else {
+                clientGone();
+            }
+            return false;
+        }
+        if (!last) {
+            return true;
+        }
+        try {
+            emitter.send(SseEmitter.event()
+                    .name(SseEvents.COMPLETE)
+                    .data(new CompleteEvent(requestId, sentChunks), MediaType.APPLICATION_JSON));
+        } catch (IOException | IllegalStateException ex) {
+            LOGGER.log(Level.DEBUG, "client left before complete event of {0}", requestId);
+        }
+        completeEmitter();
+        finish(StreamOutcome.COMPLETED);
+        return false;
+    }
+
+    /** Runs on the drainer once the queue is empty; upstream has already ended. */
+    private void handleUpstreamEnd(Status status) {
+        String code;
+        String message;
+        if (status.isOk()) {
+            if (lastSeen) {
+                return;
+            }
+            code = Status.Code.INTERNAL.name();
+            message = "upstream ended without last chunk";
+        } else {
+            code = status.getCode().name();
+            message = status.getDescription() == null ? "" : status.getDescription();
+        }
+        if (claim(StreamOutcome.UPSTREAM_ERROR)) {
+            releaseCapacity();
+            sendErrorAndComplete(code, message);
+            finish(StreamOutcome.UPSTREAM_ERROR);
+        }
+    }
+
+    /** gRPC thread: upstream violated its credit. One error, upstream cancelled, queue dropped. */
+    private void overflow() {
+        if (!claim(StreamOutcome.UPSTREAM_ERROR)) {
+            return;
+        }
+        cancelUpstream("per-request queue overflow");
+        releaseCapacity();
+        discardQueued();
+        TERMINAL_EVENT_EXECUTOR.execute(() -> {
+            sendErrorAndComplete(Status.Code.RESOURCE_EXHAUSTED.name(), "per-request queue overflow");
+            finish(StreamOutcome.UPSTREAM_ERROR);
+        });
+        scheduleDrain();
     }
 
     /**
@@ -157,20 +314,54 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
      * when the terminal event has been written (or given up on).
      */
     CompletableFuture<Void> cancelForShutdown() {
-        if (!terminal.compareAndSet(null, StreamOutcome.SHUTDOWN_CANCELLED)) {
+        if (!claim(StreamOutcome.SHUTDOWN_CANCELLED)) {
             return CompletableFuture.completedFuture(null);
         }
         cancelUpstream(StreamOutcome.SHUTDOWN_CANCELLED);
-        release(StreamOutcome.SHUTDOWN_CANCELLED);
+        releaseCapacity();
+        finish(StreamOutcome.SHUTDOWN_CANCELLED);
+        discardQueued();
         return CompletableFuture.runAsync(
                 () -> sendErrorAndComplete(Status.Code.CANCELLED.name(), SHUTDOWN_MESSAGE),
                 TERMINAL_EVENT_EXECUTOR);
     }
 
+    /**
+     * Timer thread, holds no lock. Same shape as {@link #overflow()}: the claim winner cancels
+     * upstream and frees capacity before anything is written; the error goes out on another
+     * thread so a stuck client write never blocks the shared scheduler.
+     */
+    private void timedOut(TimeoutKind kind) {
+        if (!claim(kind.outcome())) {
+            return;
+        }
+        cancelUpstream(kind.message());
+        releaseCapacity();
+        metrics.timedOut(kind);
+        discardQueued();
+        TERMINAL_EVENT_EXECUTOR.execute(() -> {
+            sendErrorAndComplete(Status.Code.DEADLINE_EXCEEDED.name(), kind.message());
+            finish(kind.outcome());
+        });
+        // A chunk offered after the discard above is dropped by the drainer.
+        scheduleDrain();
+    }
+
+    /** The only place that claims the terminal outcome; closing the timer here leaves no path that leaks it. */
+    private boolean claim(StreamOutcome outcome) {
+        if (terminal.compareAndSet(null, outcome)) {
+            timer.close();
+            return true;
+        }
+        return false;
+    }
+
     private void clientGone() {
-        if (terminal.compareAndSet(null, StreamOutcome.CLIENT_GONE)) {
+        if (claim(StreamOutcome.CLIENT_GONE)) {
             cancelUpstream(StreamOutcome.CLIENT_GONE);
-            release(StreamOutcome.CLIENT_GONE);
+            releaseCapacity();
+            finish(StreamOutcome.CLIENT_GONE);
+            discardQueued();
         }
     }
 
@@ -213,6 +404,11 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
         }
     }
 
+    /** Chunks waiting for the drainer; never more than the stream queue capacity. */
+    int queuedChunks() {
+        return queue.size();
+    }
+
     private void completeEmitter() {
         try {
             emitter.complete();
@@ -222,19 +418,39 @@ final class StreamBridge implements ClientResponseObserver<GenerateRequest, Toke
     }
 
     private void cancelUpstream(StreamOutcome outcome) {
+        cancelUpstream(cancelMessage(outcome));
+    }
+
+    private void cancelUpstream(String message) {
         ClientCallStreamObserver<GenerateRequest> stream = requestStream;
         if (stream != null) {
-            stream.cancel(cancelMessage(outcome), null);
+            stream.cancel(message, null);
         }
     }
 
-    private void release(StreamOutcome outcome) {
+    /** Permit and lease, exactly once: only the terminal claim winner calls this, before any write. */
+    private void releaseCapacity() {
         lease.close();
+        registry.releasePermit(this);
+    }
+
+    /** Leaves the tracked set once the last event has been written (or the stream was cancelled). */
+    private void finish(StreamOutcome outcome) {
         registry.unregister(this);
         LOGGER.log(Level.INFO, "Stream {0} finished: {1}", requestId, outcome);
     }
 
+    /** Whether a timeout timer is armed (tests). */
+    boolean timerArmed() {
+        return timer.isArmed();
+    }
+
     private static String cancelMessage(StreamOutcome outcome) {
-        return outcome == StreamOutcome.SHUTDOWN_CANCELLED ? SHUTDOWN_MESSAGE : "client disconnected";
+        return switch (outcome) {
+            case SHUTDOWN_CANCELLED -> SHUTDOWN_MESSAGE;
+            case FIRST_CHUNK_TIMEOUT -> TimeoutKind.FIRST_CHUNK.message();
+            case IDLE_TIMEOUT -> TimeoutKind.IDLE.message();
+            case COMPLETED, UPSTREAM_ERROR, CLIENT_GONE -> "client disconnected";
+        };
     }
 }
