@@ -370,6 +370,16 @@ Known limits of the reconnect:
   feature, and the tests use a client interceptor that it does not affect (not
   verified against a real network failure).
 
+### Stream contract tests
+
+The gateway's stream guarantees (one terminal event, permit and lease released once,
+upstream cancelled, no timer leak, bounded queue) are written as one contract in the
+tests and run on `StreamBridge` and on a deliberately flawed `LeakyStreamHandler`
+(test code only). The real bridge must violate nothing; for the flawed handler the test
+asserts that exactly the two known flaws are detected, so the build stays green. See
+[docs/failure-analysis.md](docs/failure-analysis.md). The REAL race stress cannot prove
+that no race exists; that argument is the compare-and-set in `StreamBridge.claim()`.
+
 ### Settings
 
 | Setting (`application.yaml`) | Default |
@@ -395,6 +405,7 @@ Invalid values stop the application at startup with a message naming the propert
 ## Decisions
 
 - [ADR-0001: Synthetic simulator on plain grpc-java](docs/adr/0001-simulator-on-plain-grpc-java.md)
+- [ADR-0002: Single terminal claim by CAS; capacity released before the terminal write](docs/adr/0002-single-terminal-claim.md)
 
 ## License
 

@@ -54,6 +54,28 @@ final class StreamTestSupport {
                 Retry.defaults());
     }
 
+    /** A registry that counts every {@code releasePermit} call (the contract tests assert a permit is released once). */
+    static final class CountingRegistry extends ActiveStreamRegistry {
+
+        final AtomicInteger releases = new AtomicInteger();
+
+        CountingRegistry(GatewayProperties properties) {
+            super(properties);
+        }
+
+        @Override
+        void releasePermit(StreamBridge bridge) {
+            releases.incrementAndGet();
+            super.releasePermit(bridge);
+        }
+    }
+
+    static CountingRegistry startedCountingRegistry(Duration drainTimeout) {
+        CountingRegistry registry = new CountingRegistry(properties(drainTimeout, defaultLimits(), Timeouts.defaults()));
+        registry.start();
+        return registry;
+    }
+
     /** A started scheduler with the given limits; the caller must stop it. */
     static StreamTimeouts startedTimeouts(Duration firstChunk, Duration idleBetweenChunks) {
         StreamTimeouts timeouts = new StreamTimeouts(
