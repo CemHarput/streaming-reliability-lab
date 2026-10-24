@@ -32,7 +32,7 @@ Chat UI, user accounts, RAG, vector databases, multi-cloud, Kubernetes.
 |---|---|---|
 | `proto/` | `TokenStreamService` and `SimulatorAdminService` contract | done |
 | `simulator/` | Synthetic gRPC token producer with timing and fault injection | done |
-| `gateway/` | Spring Boot SSE gateway: lifecycle, bounded queue, gRPC adapter | shared channel + SSE bridge + bounded resources (limit, per-stream queue, metrics) + first-chunk/idle timeouts and upstream-cancel checks done |
+| `gateway/` | Spring Boot SSE gateway: lifecycle, bounded queue, gRPC adapter | shared channel + SSE bridge + bounded resources (limit, per-stream queue, metrics) + first-chunk/idle timeouts and upstream-cancel checks + bounded reconnect (retry with backoff, resume) done |
 | `loadgen/` | Closed- and open-model load generator (HdrHistogram) | skeleton |
 
 ## Simulator
@@ -173,6 +173,8 @@ thread per stream, never on the gRPC callback thread.
 | `queue_depth{queue="admission"}` | gauge: requests waiting for a permit |
 | `rejected_total{reason}` | counter, reasons above |
 | `timeouts_total{kind}` | counter: streams ended by a timeout, `kind` = `first_chunk` or `idle` (see "Timeouts and cancellation") |
+| `retries_total{reason}` | counter: retry calls started, `reason` = `restart` or `resume` (see "Bounded reconnect") |
+| `retry_exhausted_total` | counter: streams that ended with the upstream error after retries or budget ran out |
 
 No Prometheus registry is on the classpath; `prometheus` appears in the exposure
 list but has no effect today. How a Prometheus registry would render the
@@ -275,6 +277,101 @@ Known limits of the gateway:
 - With a per-request connection mode (not implemented) the lease would have to be
   acquired after admission, not before as it is now with the no-op shared lease.
 
+### Bounded reconnect
+
+When the upstream call ends with `UNAVAILABLE`, the gateway starts a new call for the
+same stream instead of failing it, a bounded number of times. The client sees no
+sign of it: chunk ids stay consecutive and there is still exactly one `complete` or
+`error` event (no SSE hint is sent for a retry).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `lab.retry.max-attempts` | `3` (0..10) | number of **retries**, i.e. extra calls after the first one, so at most `max-attempts + 1` calls per stream. `0` turns retrying off. This differs from gRPC service-config `maxAttempts`, which counts all calls. |
+| `lab.retry.initial-backoff` | `100ms` | ceiling of the first retry wait; positive, not above `max-backoff` |
+| `lab.retry.max-backoff` | `2s` | ceiling of any wait; positive, shorter than `lab.upstream.stream-deadline` |
+
+- **Backoff** is exponential with full jitter: the wait before retry k (k = 0 for the
+  first retry) is a random value in `[0, min(max-backoff, initial-backoff * 2^k)]`. With
+  the defaults the ceilings are 100, 200, 400 ms. The wait can be 0.
+- **Budget:** the whole stream, all calls included, stays within
+  `lab.upstream.stream-deadline`. The budget starts when the first call starts (after
+  admission). Every retry call gets the *remaining* budget as its gRPC deadline. No
+  retry is made when the next wait is not shorter than the remaining budget, or when
+  the budget is spent by the time the wait ends.
+- **Which endings are retried:** only `UNAVAILABLE`, and only while no `last` chunk has
+  been received. `INTERNAL`, `INVALID_ARGUMENT`, `DEADLINE_EXCEEDED` (including the
+  gRPC deadline), `RESOURCE_EXHAUSTED`, `CANCELLED`, `UNKNOWN`, an OK end without a
+  `last` chunk and the first-chunk and idle timeouts of the gateway are never retried.
+- **Resume position:** a retry call carries the same `request_id`, `seed`, profile and
+  fault. With no chunk received it starts from the beginning (`resume_from_seq` unset,
+  metric reason `restart`); otherwise it sets `resume_from_seq` to *the last chunk
+  received + 1* (reason `resume`). Chunks that are received but still queued are
+  written first, so the client sees no gap and no duplicate. This deliberately differs
+  from "last chunk written + 1": resuming from the last written chunk would send the
+  queued chunks a second time. If chunks were received but none written yet, the
+  stream is resumed after them and not restarted. The simulator replays text
+  deterministically, and the end-to-end test checks that the resumed stream has
+  byte-for-byte the text of an uninterrupted call.
+- **Flow control:** the initial credit of a new call is the queue capacity minus the
+  chunks still buffered, which can be 0. Credit freed while the new call is starting
+  is held back and granted once the call has started. Upstream therefore never has
+  more credit than the queue has room for, also on a resumed call.
+- **While waiting** the stream keeps its permit and lease and stays registered; the
+  backoff is the only timer armed, so the first-chunk and idle timers cannot fire.
+  `StreamTimeouts#pendingTimers` counts a backoff too. The next call is started on a
+  virtual thread (`stream-retry`), never inside a gRPC callback and never on the
+  scheduler thread. Each new call arms its own first-chunk timer, but only when it
+  holds credit; with credit 0 it is armed when the first credit is granted. The time
+  to first chunk of a resumed call is therefore also counted in
+  `timeouts_total{kind="first_chunk"}`.
+- **Stops:** a pending wait is cancelled, and no new call is started, by a terminal
+  outcome of any kind (client gone, a failed write, shutdown cancel, timeout). The
+  *start* of shutdown does not cancel a wait that is already running: when that wait
+  ends, no call is started and the stream ends with the last `UNAVAILABLE`. During
+  drain no retry is started either: an `UNAVAILABLE` seen while the gateway is shutting
+  down ends the stream with that `UNAVAILABLE` at once. A wait in progress can therefore
+  extend the drain by up to `lab.retry.max-backoff`; if `max-backoff` is larger than
+  `lab.shutdown.drain-timeout`, the forced cancel of the drain can win and the stream
+  ends with `CANCELLED` instead of `UNAVAILABLE`.
+- **Exhaustion:** when the retries or the budget run out, the client gets one `error`
+  event with the *last* upstream status (`UNAVAILABLE` and its description).
+
+| Metric | Meaning |
+|---|---|
+| `retries_total{reason}` | counter: retry calls started; `reason` = `restart` (from the beginning) or `resume` (after received chunks) |
+| `retry_exhausted_total` | counter: streams that ended with the upstream error after the retries or the budget ran out (not counted for `max-attempts=0` or a stop by shutdown) |
+
+Both are registered at startup and read 0. Against the simulator, `UNAVAILABLE` at
+seq 3 is replayed by each resumed call: the client gets chunks 0..2 and then the
+error of the simulator, and the simulator counts 4 started and 4 faulted calls.
+
+Known limits of the reconnect:
+
+- A real LLM upstream may not support resuming at a position or reproducing the same
+  output; the lab relies on the deterministic simulator. Whether a retry is safe for
+  another upstream is not tested here.
+- An `UNAVAILABLE` after partial output can make the upstream repeat work that was
+  already done.
+- A stream that could have been rescued during drain ends with `UNAVAILABLE`.
+- The resume position trusts `seq` to be consecutive; an upstream that skips or
+  repeats a `seq` is not detected.
+- A retry call may be started and cancelled right away when shutdown or a client
+  disconnect wins the race with the end of the wait; the simulator then counts one
+  extra started and cancelled call.
+- Whether Tomcat notices a disconnected client during a wait, when nothing is being
+  written, has not been verified (hypothesis); the wait is bounded by the budget.
+- With a future per-request connection mode the lease would have to live across the
+  retries of a stream.
+- The jitter can be 0, so a retry can follow immediately. The end-to-end tests assert
+  counts and content, not durations.
+- The emitter timeout (stream deadline + 5 s) also includes the time spent waiting for
+  admission (unchanged).
+- The transparent retry of gRPC itself stays enabled. It is not configured by this
+  feature, and the tests use a client interceptor that it does not affect (not
+  verified against a real network failure).
+
+### Settings
+
 | Setting (`application.yaml`) | Default |
 |---|---|
 | `lab.connection-mode` | `shared` (only value for now) |
@@ -289,6 +386,9 @@ Known limits of the gateway:
 | `lab.limits.stream-queue-capacity` | `16` (1..4096) |
 | `lab.timeouts.first-chunk` | `30s` (positive, shorter than `lab.upstream.stream-deadline`) |
 | `lab.timeouts.idle-between-chunks` | `30s` (positive, shorter than `lab.upstream.stream-deadline`) |
+| `lab.retry.max-attempts` | `3` (0..10; number of retries, `0` = off) |
+| `lab.retry.initial-backoff` | `100ms` (positive, not above `max-backoff`) |
+| `lab.retry.max-backoff` | `2s` (positive, shorter than `lab.upstream.stream-deadline`) |
 
 Invalid values stop the application at startup with a message naming the property.
 

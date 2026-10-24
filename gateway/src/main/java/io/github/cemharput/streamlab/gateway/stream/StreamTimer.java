@@ -9,13 +9,17 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
 /**
- * The timeout timer of one stream: at most one armed task at a time (first chunk, then idle).
+ * The timer of one stream: at most one armed task at a time (first chunk, then idle, or the retry backoff
+ * between two upstream calls).
  *
  * <p>All state sits behind a leaf lock. Only {@code schedule} and {@code cancel} run under it:
  * no write, no {@code sendLock}, no registry lock, and the expiry callback runs after the lock
  * was released. A stale task (replaced or cancelled after it was already dequeued) is ignored
  * through its token. The idle timer is armed only while the upstream holds credit, i.e. while
  * silence really is the upstream's doing; it is reset by each chunk <em>received</em>.
+ *
+ * <p>Every upstream call restarts the cycle ({@link #start}); between two calls only the backoff
+ * ({@link #scheduleRetry}) is armed and idle cannot be, because no call is active.
  */
 final class StreamTimer {
 
@@ -24,10 +28,13 @@ final class StreamTimer {
     /** Identity token of one scheduled task. */
     private static final class Armed {
         final TimeoutKind kind;
+        /** Non-null for a retry backoff (then {@code kind} is null); never set for a timeout. */
+        final Runnable retryTask;
         ScheduledFuture<?> future;
 
-        Armed(TimeoutKind kind) {
+        Armed(TimeoutKind kind, Runnable retryTask) {
             this.kind = kind;
+            this.retryTask = retryTask;
         }
     }
 
@@ -37,6 +44,7 @@ final class StreamTimer {
     private boolean closed;
     private boolean firstChunkSeen;
     private boolean upstreamDone;
+    private boolean callActive;
     private int outstanding;
     private Armed armed;
 
@@ -45,12 +53,19 @@ final class StreamTimer {
         this.onExpiry = onExpiry;
     }
 
-    /** The upstream call is about to start with {@code credit} messages granted. */
+    /**
+     * An upstream call is about to start with {@code credit} messages granted (per call: resets the
+     * first-chunk cycle). The first-chunk timer is armed only when there is credit: without credit the
+     * upstream cannot send and its silence is not its own doing; it arms on the first grant.
+     */
     void start(int credit) {
         timerLock.lock();
         try {
             outstanding = credit;
-            if (!closed) {
+            firstChunkSeen = false;
+            callActive = true;
+            disarm();
+            if (!closed && !upstreamDone && credit > 0) {
                 arm(TimeoutKind.FIRST_CHUNK, timeouts.firstChunk());
             }
         } finally {
@@ -67,8 +82,12 @@ final class StreamTimer {
             if (last) {
                 upstreamDone = true;
             }
+            if (armed != null && armed.retryTask != null) {
+                // A stray chunk (no call is active) must not cancel the backoff.
+                return;
+            }
             disarm();
-            if (!closed && !upstreamDone && outstanding > 0) {
+            if (!closed && !upstreamDone && callActive && outstanding > 0) {
                 arm(TimeoutKind.IDLE, timeouts.idleBetweenChunks());
             }
         } finally {
@@ -78,11 +97,20 @@ final class StreamTimer {
 
     /** One credit is about to be handed back to upstream (call right before {@code request(1)}). */
     void creditGranted() {
+        creditGranted(1);
+    }
+
+    /** {@code count} credits are about to be handed to the current call. */
+    void creditGranted(int count) {
         timerLock.lock();
         try {
-            outstanding++;
-            if (!closed && !upstreamDone && firstChunkSeen && armed == null && outstanding > 0) {
-                arm(TimeoutKind.IDLE, timeouts.idleBetweenChunks());
+            outstanding += count;
+            if (!closed && !upstreamDone && callActive && armed == null && outstanding > 0) {
+                if (firstChunkSeen) {
+                    arm(TimeoutKind.IDLE, timeouts.idleBetweenChunks());
+                } else {
+                    arm(TimeoutKind.FIRST_CHUNK, timeouts.firstChunk());
+                }
             }
         } finally {
             timerLock.unlock();
@@ -95,6 +123,52 @@ final class StreamTimer {
         try {
             upstreamDone = true;
             disarm();
+        } finally {
+            timerLock.unlock();
+        }
+    }
+
+    /** The current call ended with a retryable status: no timeout can fire until the next {@link #start}. */
+    void callEnded() {
+        timerLock.lock();
+        try {
+            callActive = false;
+            disarm();
+        } finally {
+            timerLock.unlock();
+        }
+    }
+
+    /**
+     * Occupies the single slot with a backoff of {@code delay}; {@code task} runs on the scheduler thread without
+     * any lock and must only hand off. Returns false when the timer is closed or the scheduler is not running.
+     */
+    boolean scheduleRetry(Duration delay, Runnable task) {
+        timerLock.lock();
+        try {
+            if (closed) {
+                return false;
+            }
+            disarm();
+            Armed token = new Armed(null, task);
+            try {
+                token.future = timeouts.schedule(() -> fire(token), delay);
+                armed = token;
+                return true;
+            } catch (RejectedExecutionException ex) {
+                LOGGER.log(Level.DEBUG, "timeout scheduler not running; retry not scheduled");
+                return false;
+            }
+        } finally {
+            timerLock.unlock();
+        }
+    }
+
+    /** Whether the armed task is a retry backoff (tests). */
+    boolean retryPending() {
+        timerLock.lock();
+        try {
+            return armed != null && armed.retryTask != null;
         } finally {
             timerLock.unlock();
         }
@@ -132,7 +206,7 @@ final class StreamTimer {
     /** Caller holds the lock. */
     private void arm(TimeoutKind kind, Duration delay) {
         disarm();
-        Armed token = new Armed(kind);
+        Armed token = new Armed(kind, null);
         try {
             // The task cannot pass its token check before this method released the lock.
             token.future = timeouts.schedule(() -> fire(token), delay);
@@ -160,6 +234,10 @@ final class StreamTimer {
         } finally {
             timerLock.unlock();
         }
-        onExpiry.accept(token.kind);
+        if (token.retryTask != null) {
+            token.retryTask.run();
+        } else {
+            onExpiry.accept(token.kind);
+        }
     }
 }

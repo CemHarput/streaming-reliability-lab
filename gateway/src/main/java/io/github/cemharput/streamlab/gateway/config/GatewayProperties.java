@@ -10,9 +10,13 @@ public record GatewayProperties(
         @DefaultValue Upstream upstream,
         @DefaultValue Shutdown shutdown,
         @DefaultValue Limits limits,
-        @DefaultValue Timeouts timeouts) {
+        @DefaultValue Timeouts timeouts,
+        @DefaultValue Retry retry) {
 
     public GatewayProperties {
+        if (upstream != null && retry != null) {
+            requireShorterThanDeadline(retry.maxBackoff(), "lab.retry.max-backoff", upstream.streamDeadline());
+        }
         if (upstream != null && timeouts != null) {
             requireShorterThanDeadline(timeouts.firstChunk(), "lab.timeouts.first-chunk", upstream.streamDeadline());
             requireShorterThanDeadline(timeouts.idleBetweenChunks(), "lab.timeouts.idle-between-chunks",
@@ -95,6 +99,38 @@ public record GatewayProperties(
 
         public static Timeouts defaults() {
             return new Timeouts(Duration.ofSeconds(30), Duration.ofSeconds(30));
+        }
+    }
+
+    /**
+     * Bounded reconnect. {@code maxAttempts} counts <em>retries</em> (extra upstream calls after the first),
+     * so at most {@code maxAttempts + 1} calls are made; 0 disables retrying.
+     */
+    public record Retry(
+            @DefaultValue("3") int maxAttempts,
+            @DefaultValue("100ms") Duration initialBackoff,
+            @DefaultValue("2s") Duration maxBackoff) {
+
+        public static final int MAX_ATTEMPTS = 10;
+
+        public Retry {
+            if (maxAttempts < 0 || maxAttempts > MAX_ATTEMPTS) {
+                throw new IllegalArgumentException("lab.retry.max-attempts must be between 0 and " + MAX_ATTEMPTS);
+            }
+            requirePositive(initialBackoff, "lab.retry.initial-backoff");
+            requirePositive(maxBackoff, "lab.retry.max-backoff");
+            if (initialBackoff.compareTo(maxBackoff) > 0) {
+                throw new IllegalArgumentException("lab.retry.initial-backoff (" + initialBackoff
+                        + ") must not exceed lab.retry.max-backoff (" + maxBackoff + ")");
+            }
+        }
+
+        public static Retry defaults() {
+            return new Retry(3, Duration.ofMillis(100), Duration.ofSeconds(2));
+        }
+
+        public static Retry disabled() {
+            return new Retry(0, Duration.ofMillis(100), Duration.ofSeconds(2));
         }
     }
 

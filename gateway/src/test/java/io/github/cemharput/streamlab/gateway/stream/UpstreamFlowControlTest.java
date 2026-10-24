@@ -9,6 +9,7 @@ import io.github.cemharput.streamlab.gateway.stream.StreamTestSupport.RecordingE
 import io.github.cemharput.streamlab.simulator.RequestLimits;
 import io.github.cemharput.streamlab.simulator.SimulatorConfig;
 import io.github.cemharput.streamlab.simulator.SimulatorServer;
+import io.github.cemharput.streamlab.testsupport.FaultInjectingInterceptor;
 import io.github.cemharput.streamlab.tokenstream.v1.GenerateRequest;
 import io.github.cemharput.streamlab.tokenstream.v1.GetStatsRequest;
 import io.github.cemharput.streamlab.tokenstream.v1.SimulatorAdminServiceGrpc;
@@ -33,6 +34,8 @@ class UpstreamFlowControlTest {
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
 
     private SimulatorServer server;
+    private final FaultInjectingInterceptor faults = new FaultInjectingInterceptor();
+    private ManagedChannel faultyChannel;
     private ManagedChannel channel;
     private SimulatorAdminServiceGrpc.SimulatorAdminServiceBlockingStub admin;
 
@@ -43,11 +46,13 @@ class UpstreamFlowControlTest {
                 InProcessServerBuilder.forName(name),
                 new SimulatorConfig(0, Duration.ofSeconds(2), 2, RequestLimits.DEFAULT));
         channel = InProcessChannelBuilder.forName(name).build();
+        faultyChannel = InProcessChannelBuilder.forName(name).intercept(faults).build();
         admin = SimulatorAdminServiceGrpc.newBlockingStub(channel);
     }
 
     @AfterEach
     void tearDown() throws Exception {
+        faultyChannel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
         channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
         server.stop();
     }
@@ -140,6 +145,73 @@ class UpstreamFlowControlTest {
             await().atMost(TIMEOUT).until(() -> registry.activeCount() == 0);
             assertThat(timeouts.pendingTimers()).isZero();
             assertThat(meters.get("timeouts_total").tag("kind", "idle").counter().count()).isZero();
+        } finally {
+            emitter.gate.countDown();
+            timeouts.stop();
+        }
+    }
+
+    /**
+     * A resumed call whose initial credit is 0: the client stalled with the whole queue buffered, so the new
+     * call may not send anything until the client reads. Proves on real gRPC that a zero initial request is
+     * valid, that the credit handed back while the call starts is not lost, and that nothing overflows.
+     */
+    @Test
+    void resumedCallWithNoFreeCreditWaitsForTheClient() {
+        int capacity = 2;
+        int chunks = 50;
+        ActiveStreamRegistry registry = startedRegistry(Duration.ofSeconds(1));
+        SimpleMeterRegistry meters = new SimpleMeterRegistry();
+        StreamTimeouts timeouts = StreamTestSupport.startedTimeouts(Duration.ofSeconds(30), Duration.ofSeconds(30));
+        RecordingEmitter emitter = RecordingEmitter.stalled();
+        GenerateRequest request = GenerateRequest.newBuilder()
+                .setRequestId("r-resume")
+                .setSeed(42)
+                .setProfile(StreamProfile.newBuilder().setChunkCount(chunks).setFirstChunkDelayMs(1).setChunkIntervalMs(1))
+                .build();
+        UpstreamStarter starter = (upstreamRequest, deadline, observer) -> TokenStreamServiceGrpc.newStub(faultyChannel)
+                .withDeadlineAfter(deadline.toNanos(), TimeUnit.NANOSECONDS)
+                .generateTokens(upstreamRequest, observer);
+        RetryPolicy policy = new RetryPolicy(3, Duration.ofMillis(1), Duration.ofMillis(1), b -> 0, System::nanoTime);
+        StreamBridge bridge = new StreamBridge(request, emitter, registry, NO_LEASE, capacity,
+                new StreamMetrics(meters, registry), timeouts, policy, starter, Duration.ofSeconds(30));
+        assertThat(registry.tryRegister(bridge)).isTrue();
+        faults.cutNextCalls(1, capacity);
+        try {
+            bridge.start();
+
+            // Call 1 delivered 2 chunks (one stuck in the write, one queued) and was cut; call 2 has no credit.
+            await().atMost(TIMEOUT).untilAsserted(() -> {
+                assertThat(stats().getStartedTotal()).isEqualTo(2);
+                assertThat(stats().getCancelledTotal()).isEqualTo(1);
+                assertThat(meters.get("retries_total").tag("reason", "resume").counter().count()).isEqualTo(1);
+                assertThat(bridge.bufferedChunks()).isEqualTo(capacity);
+            });
+            await().during(Duration.ofMillis(500)).atMost(TIMEOUT).untilAsserted(() -> {
+                assertThat(stats().getChunksEmittedTotal()).as("the resumed call has no credit").isEqualTo(capacity);
+                assertThat(bridge.queuedChunks()).isLessThanOrEqualTo(capacity);
+                assertThat(emitter.events).isEmpty();
+                assertThat(registry.activeCount()).isEqualTo(1);
+                assertThat(stats().getActiveGenerations()).isEqualTo(1);
+            });
+
+            emitter.gate.countDown();
+
+            await().atMost(TIMEOUT).until(() -> emitter.completed);
+            assertThat(emitter.events).hasSize(chunks + 1);
+            for (int i = 0; i < chunks; i++) {
+                assertThat(emitter.events.get(i)).contains("event:chunk").contains("id:" + i + "\n");
+            }
+            assertThat(emitter.events.get(chunks)).contains("event:complete");
+            await().atMost(TIMEOUT).untilAsserted(() -> {
+                assertThat(stats().getActiveGenerations()).isZero();
+                assertThat(registry.activeCount()).isZero();
+                assertThat(timeouts.pendingTimers()).isZero();
+                assertThat(StreamTestSupport.gauge(meters, "queue_depth", "chunks")).isZero();
+            });
+            assertThat(stats().getStartedTotal()).isEqualTo(2);
+            assertThat(stats().getCancelledTotal()).isEqualTo(1);
+            assertThat(faults.interceptedCalls()).isEqualTo(2);
         } finally {
             emitter.gate.countDown();
             timeouts.stop();

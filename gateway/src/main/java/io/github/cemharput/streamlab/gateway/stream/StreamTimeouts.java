@@ -20,7 +20,7 @@ import org.springframework.stereotype.Component;
  * (claim, cancel upstream, release capacity) and hands the client write to another thread,
  * so a stuck client can never delay another stream's timer. Cancelled timers leave the
  * queue at once ({@code removeOnCancel}), so {@link #pendingTimers()} equals the number of
- * armed timers and is the leak indicator the tests use.
+ * armed timers (a retry backoff counts too) and is the leak indicator the tests use.
  *
  * <p>Lifecycle: starts before stream admission and stops after it (see {@link LifecyclePhases}).
  */

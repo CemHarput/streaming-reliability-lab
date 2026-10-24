@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "slug": "gateway-bounded-reconnect",
+  "status": "implemented",
+  "review": "completed",
+  "created_at": "2026-10-24T13:08:46.200240+00:00",
+  "updated_at": "2026-10-24T14:25:17.436082+00:00",
+  "approved_plan_sha256": "0b870572d5ae2f9be28f349a1ead1776426ff273e1ae8e19574f64832a0e0b80",
+  "baseline_head": "a130d7878c8c660774366e869e15c5cce77858e8",
+  "approved_at": "2026-10-24T13:23:29.787240+00:00",
+  "reviewed_at": "2026-10-24T14:25:17.436071+00:00"
+}

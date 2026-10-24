@@ -4,6 +4,7 @@ import io.github.cemharput.streamlab.gateway.config.GatewayProperties;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.ConnectionMode;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Shutdown;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Limits;
+import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Retry;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.OverloadPolicy;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Timeouts;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Upstream;
@@ -12,6 +13,7 @@ import io.github.cemharput.streamlab.tokenstream.v1.GenerateRequest;
 import io.github.cemharput.streamlab.tokenstream.v1.TokenChunk;
 import io.grpc.Channel;
 import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientResponseObserver;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.IOException;
 import java.time.Duration;
@@ -20,6 +22,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -46,7 +50,8 @@ final class StreamTestSupport {
                 new Upstream("localhost:1", Duration.ofSeconds(60)),
                 new Shutdown(drainTimeout, Duration.ofSeconds(1)),
                 limits,
-                timeouts);
+                timeouts,
+                Retry.defaults());
     }
 
     /** A started scheduler with the given limits; the caller must stop it. */
@@ -95,7 +100,65 @@ final class StreamTestSupport {
 
     static StreamBridge newBridge(SseEmitter emitter, ActiveStreamRegistry registry, ChannelProvider.Lease lease,
             int capacity, StreamMetrics metrics, StreamTimeouts timeouts) {
-        return new StreamBridge("r", emitter, registry, lease, capacity, metrics, timeouts);
+        return new StreamBridge(GenerateRequest.newBuilder().setRequestId("r").build(), emitter, registry, lease,
+                capacity, metrics, timeouts, RetryPolicy.disabled(), NO_STARTER, Duration.ofSeconds(60));
+    }
+
+    /** For bridges whose calls are driven by direct observer calls: starting a call is a bug in the test. */
+    static final UpstreamStarter NO_STARTER = (request, deadline, observer) -> {
+        throw new UnsupportedOperationException("no upstream in this test");
+    };
+
+    /** A bridge that retries through {@code starter}; call {@code start()} after registering it. */
+    static StreamBridge newRetryingBridge(SseEmitter emitter, ActiveStreamRegistry registry,
+            ChannelProvider.Lease lease, int capacity, StreamMetrics metrics, StreamTimeouts timeouts,
+            RetryPolicy policy, UpstreamStarter starter, Duration deadline) {
+        GenerateRequest request = GenerateRequest.newBuilder().setRequestId("r").setSeed(7).build();
+        return new StreamBridge(request, emitter, registry, lease, capacity, metrics, timeouts, policy, starter,
+                deadline);
+    }
+
+    /** A clock the test moves by hand. */
+    static final class ManualClock implements java.util.function.LongSupplier {
+
+        private final AtomicLong nanos = new AtomicLong(1_000_000_000L);
+
+        @Override
+        public long getAsLong() {
+            return nanos.get();
+        }
+
+        void advance(Duration by) {
+            nanos.addAndGet(by.toNanos());
+        }
+    }
+
+    /**
+     * Starts fake upstream calls: every start creates a new {@link FakeUpstream}, runs the observer's
+     * {@code beforeStart} synchronously (like the stub does) and then the {@link #onStart} hook, which may
+     * deliver chunks, fail the call or wait on a latch.
+     */
+    static final class FakeUpstreamStarter implements UpstreamStarter {
+
+        record Call(GenerateRequest request, Duration deadline,
+                ClientResponseObserver<GenerateRequest, TokenChunk> observer, FakeUpstream upstream) {
+        }
+
+        final List<Call> calls = new CopyOnWriteArrayList<>();
+        volatile Consumer<Call> onStart = call -> { };
+        /** Runs after the call is recorded and before `beforeStart`: lets a test claim the stream at that instant. */
+        volatile Consumer<Call> beforeStartHook = call -> { };
+
+        @Override
+        public void start(GenerateRequest request, Duration deadline,
+                ClientResponseObserver<GenerateRequest, TokenChunk> observer) {
+            FakeUpstream upstream = new FakeUpstream();
+            Call call = new Call(request, deadline, observer, upstream);
+            calls.add(call);
+            beforeStartHook.accept(call);
+            observer.beforeStart(upstream);
+            onStart.accept(call);
+        }
     }
 
     static TokenChunk chunk(int seq, boolean last) {
@@ -134,9 +197,10 @@ final class StreamTestSupport {
 
         final List<String> events = new CopyOnWriteArrayList<>();
         final CountDownLatch gate;
-        final boolean failSends;
+        volatile boolean failSends;
         volatile boolean sendInProgress;
         volatile boolean completed;
+        private volatile Runnable completionCallback = () -> { };
 
         RecordingEmitter(CountDownLatch gate, boolean failSends) {
             this.gate = gate;
@@ -175,6 +239,17 @@ final class StreamTestSupport {
         @Override
         public void complete() {
             completed = true;
+        }
+
+        @Override
+        public void onCompletion(Runnable callback) {
+            super.onCompletion(callback);
+            completionCallback = callback;
+        }
+
+        /** The container reports that the response ended (client disconnected). */
+        void simulateClientGone() {
+            completionCallback.run();
         }
     }
 
@@ -221,8 +296,13 @@ final class StreamTestSupport {
 
         /** Delivers a chunk the way gRPC would, counting it against the credit. */
         void deliver(StreamBridge bridge, TokenChunk chunk) {
+            deliver((ClientResponseObserver<GenerateRequest, TokenChunk>) bridge, chunk);
+        }
+
+        /** Delivers to a specific attempt's observer. */
+        void deliver(ClientResponseObserver<?, TokenChunk> observer, TokenChunk chunk) {
             delivered.incrementAndGet();
-            bridge.onNext(chunk);
+            observer.onNext(chunk);
         }
 
         @Override

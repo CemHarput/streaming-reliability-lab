@@ -9,11 +9,13 @@ import io.github.cemharput.streamlab.gateway.config.GatewayProperties.OverloadPo
 import io.github.cemharput.streamlab.testsupport.InProcessSimulatorConfig;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 
+@Timeout(value = 60, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
 class ConnectionModeConfigTest {
 
     private SpringApplicationBuilder builder() {
@@ -45,7 +47,42 @@ class ConnectionModeConfigTest {
             assertThat(properties.limits().streamQueueCapacity()).isEqualTo(16);
             assertThat(properties.timeouts().firstChunk()).isEqualTo(Duration.ofSeconds(30));
             assertThat(properties.timeouts().idleBetweenChunks()).isEqualTo(Duration.ofSeconds(30));
+            assertThat(properties.retry().maxAttempts()).isEqualTo(3);
+            assertThat(properties.retry().initialBackoff()).isEqualTo(Duration.ofMillis(100));
+            assertThat(properties.retry().maxBackoff()).isEqualTo(Duration.ofSeconds(2));
         }
+    }
+
+    @Test
+    void retryIsBoundFromRelaxedNames() {
+        try (ConfigurableApplicationContext context = builder().run("--lab.retry.max-attempts=5",
+                "--lab.retry.initialBackoff=50ms", "--lab.retry.max-backoff=1500ms")) {
+            GatewayProperties.Retry retry = context.getBean(GatewayProperties.class).retry();
+            assertThat(retry.maxAttempts()).isEqualTo(5);
+            assertThat(retry.initialBackoff()).isEqualTo(Duration.ofMillis(50));
+            assertThat(retry.maxBackoff()).isEqualTo(Duration.ofMillis(1500));
+        }
+    }
+
+    @Test
+    void zeroAttemptsDisablesRetryAndIsValid() {
+        try (ConfigurableApplicationContext context = builder().run("--lab.retry.max-attempts=0")) {
+            assertThat(context.getBean(GatewayProperties.class).retry().maxAttempts()).isZero();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "--lab.retry.max-attempts=-1",
+            "--lab.retry.max-attempts=11",
+            "--lab.retry.initial-backoff=0s",
+            "--lab.retry.max-backoff=-1s",
+            "--lab.retry.initial-backoff=3s",
+            "--lab.retry.max-backoff=60s"})
+    void invalidRetryFailsAtStartup(String argument) {
+        String property = argument.substring(2, argument.indexOf('='));
+        assertThatThrownBy(() -> builder().run(argument).close())
+                .hasStackTraceContaining(property);
     }
 
     @Test

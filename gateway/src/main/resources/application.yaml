@@ -24,6 +24,10 @@ lab:
   timeouts:
     first-chunk: 30s
     idle-between-chunks: 30s
+  retry:
+    max-attempts: 3
+    initial-backoff: 100ms
+    max-backoff: 2s
   shutdown:
     drain-timeout: 10s
     channel-termination-timeout: 5s

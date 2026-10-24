@@ -3,7 +3,6 @@ package io.github.cemharput.streamlab.gateway.stream;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties;
 import io.github.cemharput.streamlab.gateway.upstream.ChannelProvider;
 import io.github.cemharput.streamlab.tokenstream.v1.TokenStreamServiceGrpc;
-import io.grpc.Status;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -28,6 +27,7 @@ public class StreamController {
     private final StreamMetrics metrics;
     private final StreamTimeouts timeouts;
     private final int streamQueueCapacity;
+    private final RetryPolicy retryPolicy;
 
     public StreamController(ChannelProvider channels, ActiveStreamRegistry registry, StreamMetrics metrics,
             StreamTimeouts timeouts, GatewayProperties properties) {
@@ -37,6 +37,7 @@ public class StreamController {
         this.timeouts = timeouts;
         this.streamQueueCapacity = properties.limits().streamQueueCapacity();
         this.streamDeadline = properties.upstream().streamDeadline();
+        this.retryPolicy = RetryPolicy.from(properties.retry());
     }
 
     @GetMapping(path = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
@@ -63,20 +64,19 @@ public class StreamController {
         }
 
         SseEmitter emitter = new SseEmitter(streamDeadline.toMillis() + EMITTER_TIMEOUT_MARGIN_MS);
-        StreamBridge bridge = new StreamBridge(requestId, emitter, registry, lease, streamQueueCapacity, metrics, timeouts);
+        UpstreamStarter starter = (upstreamRequest, deadline, observer) -> TokenStreamServiceGrpc.newStub(lease.channel())
+                .withDeadlineAfter(deadline.toNanos(), TimeUnit.NANOSECONDS)
+                .generateTokens(upstreamRequest, observer);
+        StreamBridge bridge = new StreamBridge(params.toRequest(requestId), emitter, registry, lease,
+                streamQueueCapacity, metrics, timeouts, retryPolicy, starter, streamDeadline);
         ActiveStreamRegistry.Admission admission = registry.admit(bridge);
         if (admission != ActiveStreamRegistry.Admission.ADMITTED) {
             lease.close();
             metrics.rejected(reason(admission));
             return unavailable();
         }
-        try {
-            TokenStreamServiceGrpc.newStub(lease.channel())
-                    .withDeadlineAfter(streamDeadline.toMillis(), TimeUnit.MILLISECONDS)
-                    .generateTokens(params.toRequest(requestId), bridge);
-        } catch (RuntimeException ex) {
-            bridge.onError(Status.INTERNAL.withDescription("failed to start upstream call").withCause(ex).asRuntimeException());
-        }
+        // A failing start is reported to the client as an INTERNAL error event by the bridge itself.
+        bridge.start();
         return ResponseEntity.ok()
                 .header(REQUEST_ID_HEADER, requestId)
                 .body(emitter);
