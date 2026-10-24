@@ -5,9 +5,11 @@ lifecycle, bounded concurrency, backpressure and recovery after failure.
 Everything is synthetic: no real LLM, no API key.
 
 > Status: **stage 1 in progress.** The gRPC contract, the synthetic simulator
-> and the gateway's shared-channel SSE bridge with bounded resources (active
-> stream limit, per-stream queue, metrics) and upstream timeouts with
-> cancellation checks are done and tested. The load generator is a skeleton.
+> and the gateway's SSE bridge with bounded resources (active
+> stream limit, per-stream queue, metrics), upstream timeouts with
+> cancellation checks and two selectable connection modes (shared channel,
+> channel per request) are done and tested. The two modes have not been
+> compared for performance. The load generator is a skeleton.
 
 ## Problem
 
@@ -32,7 +34,7 @@ Chat UI, user accounts, RAG, vector databases, multi-cloud, Kubernetes.
 |---|---|---|
 | `proto/` | `TokenStreamService` and `SimulatorAdminService` contract | done |
 | `simulator/` | Synthetic gRPC token producer with timing and fault injection | done |
-| `gateway/` | Spring Boot SSE gateway: lifecycle, bounded queue, gRPC adapter | shared channel + SSE bridge + bounded resources (limit, per-stream queue, metrics) + first-chunk/idle timeouts and upstream-cancel checks + bounded reconnect (retry with backoff, resume) done |
+| `gateway/` | Spring Boot SSE gateway: lifecycle, bounded queue, gRPC adapter | shared channel + selectable connection modes (shared / per-request) + SSE bridge + bounded resources (limit, per-stream queue, metrics) + first-chunk/idle timeouts and upstream-cancel checks + bounded reconnect (retry with backoff, resume) done |
 | `loadgen/` | Closed- and open-model load generator (HdrHistogram) | skeleton |
 
 ## Simulator
@@ -92,8 +94,9 @@ grpcurl -plaintext -d '{"request_id":"demo","seed":7,"profile":{"chunk_count":5,
 
 ## Gateway
 
-`GET /stream` opens one upstream `GenerateTokens` call on a single shared,
-lifecycle-managed gRPC channel and relays chunks as Server-Sent Events.
+`GET /stream` opens one upstream `GenerateTokens` call on a gRPC channel (one shared,
+lifecycle-managed channel by default; see "Connection modes") and relays chunks as
+Server-Sent Events.
 
 | Query parameter | Default | Meaning |
 |---|---|---|
@@ -175,6 +178,7 @@ thread per stream, never on the gRPC callback thread.
 | `timeouts_total{kind}` | counter: streams ended by a timeout, `kind` = `first_chunk` or `idle` (see "Timeouts and cancellation") |
 | `retries_total{reason}` | counter: retry calls started, `reason` = `restart` or `resume` (see "Bounded reconnect") |
 | `retry_exhausted_total` | counter: streams that ended with the upstream error after retries or budget ran out |
+| `connection_mode{mode}` | gauge, always 1 for the configured mode; `mode` = `shared` or `per_request` (see "Connection modes") |
 
 No Prometheus registry is on the classpath; `prometheus` appears in the exposure
 list but has no effect today. How a Prometheus registry would render the
@@ -274,8 +278,48 @@ Known limits of the gateway:
 - Both timeouts must be shorter than `lab.upstream.stream-deadline`: lowering the
   deadline below 30 s means lowering both timeouts too, or the application does not
   start.
-- With a per-request connection mode (not implemented) the lease would have to be
-  acquired after admission, not before as it is now with the no-op shared lease.
+- In per-request mode the lease is still acquired before admission, but it does not
+  create a channel: the channel is created by the first `channel()` call, which the
+  stream makes after admission, so rejected and waiting requests never open one.
+
+### Connection modes
+
+`lab.connection-mode` selects how streams get their upstream channel. The default is `shared`.
+An invalid or empty value stops the application at startup (an unset property uses the
+default). The configured mode is logged once at startup (INFO) and exposed as
+`connection_mode{mode}`.
+
+- **`shared`**: one channel is created at startup, kept warm by the channel watcher, and used
+  by all streams. A stream's lease does nothing on close. The channel is shut down once when
+  the application stops.
+- **`per-request`**: every stream has its own channel. The channel is created by the lease's
+  first `channel()` call, i.e. when the first upstream call of an admitted stream starts, with no
+  lock held; it is not created for rejected or waiting requests. The stream's terminal path
+  (completion, upstream error, client gone, timeout, overflow, shutdown cancel) closes the
+  lease once, which calls `ManagedChannel.shutdown()` (graceful, non-blocking). Retries and
+  resumes of the stream reuse its channel, so one stream opens one channel. If the channel
+  cannot be created, that stream ends with an `INTERNAL` error event and other streams are not
+  affected. On application stop, channels still open are closed as a backstop and waited for
+  up to `lab.shutdown.channel-termination-timeout` before `shutdownNow()`.
+- Readiness in per-request mode reflects the application lifecycle only: there is no long-lived
+  channel to probe. In shared mode it reflects the channel's connectivity state.
+- Six simulator scenarios of the stream contract (single terminal event, release once, upstream
+  cancelled, no timer leak, bounded queue) run against the real simulator in both modes, and the
+  tests count how often each channel is shut down; the other contract and race tests do not go
+  through a channel provider.
+
+**Not measured yet.** This feature makes the two modes comparable; it makes no performance claim.
+All tests use in-process channels, which have no sockets, no event-loop threads and no connect
+backoff. Not measured or not tested:
+
+- latency and throughput of either mode
+- CPU and memory cost
+- the cost of establishing a connection per stream
+- real Netty / TCP / HTTP/2 behaviour
+- TLS
+- sharing of Netty event loops between channels
+- ports and `TIME_WAIT` under many short streams
+- the effect of connect backoff after a real network failure
 
 ### Bounded reconnect
 
@@ -360,8 +404,8 @@ Known limits of the reconnect:
   extra started and cancelled call.
 - Whether Tomcat notices a disconnected client during a wait, when nothing is being
   written, has not been verified (hypothesis); the wait is bounded by the budget.
-- With a future per-request connection mode the lease would have to live across the
-  retries of a stream.
+- In per-request mode the lease lives across the retries of a stream: all calls of one
+  stream use the same channel, which is closed once when the stream ends.
 - The jitter can be 0, so a retry can follow immediately. The end-to-end tests assert
   counts and content, not durations.
 - The emitter timeout (stream deadline + 5 s) also includes the time spent waiting for
@@ -388,7 +432,7 @@ without asserting the winner; details in the same document.
 
 | Setting (`application.yaml`) | Default |
 |---|---|
-| `lab.connection-mode` | `shared` (only value for now) |
+| `lab.connection-mode` | `shared` (`shared` or `per-request`) |
 | `lab.upstream.target` | `localhost:50051` |
 | `lab.upstream.stream-deadline` | `60s` |
 | `lab.shutdown.drain-timeout` | `10s` |
@@ -410,6 +454,7 @@ Invalid values stop the application at startup with a message naming the propert
 
 - [ADR-0001: Synthetic simulator on plain grpc-java](docs/adr/0001-simulator-on-plain-grpc-java.md)
 - [ADR-0002: Single terminal claim by CAS; capacity released before the terminal write](docs/adr/0002-single-terminal-claim.md)
+- [ADR-0003: Per-request connection mode](docs/adr/0003-per-request-connection-mode.md)
 
 ## License
 

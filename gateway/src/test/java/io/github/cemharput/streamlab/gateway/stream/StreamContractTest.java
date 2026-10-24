@@ -5,6 +5,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
+import io.github.cemharput.streamlab.gateway.config.GatewayProperties;
+import io.github.cemharput.streamlab.gateway.config.GatewayProperties.ConnectionMode;
+import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Limits;
+import io.github.cemharput.streamlab.gateway.config.GatewayProperties.Timeouts;
 import io.github.cemharput.streamlab.gateway.stream.StreamContract.Clause;
 import io.github.cemharput.streamlab.gateway.stream.StreamContract.Observation;
 import io.github.cemharput.streamlab.gateway.stream.StreamContract.Scenario;
@@ -13,9 +17,14 @@ import io.github.cemharput.streamlab.gateway.stream.StreamTestSupport.CountingLe
 import io.github.cemharput.streamlab.gateway.stream.StreamTestSupport.RecordingEmitter;
 import io.github.cemharput.streamlab.gateway.stream.StreamUnderTest.Kind;
 import io.github.cemharput.streamlab.gateway.stream.StreamUnderTest.Wiring;
+import io.github.cemharput.streamlab.gateway.upstream.ChannelProvider;
+import io.github.cemharput.streamlab.gateway.upstream.PerRequestChannelProvider;
+import io.github.cemharput.streamlab.gateway.upstream.SharedChannelProvider;
 import io.github.cemharput.streamlab.simulator.RequestLimits;
 import io.github.cemharput.streamlab.simulator.SimulatorConfig;
 import io.github.cemharput.streamlab.simulator.SimulatorServer;
+import io.github.cemharput.streamlab.testsupport.CountingChannelFactory;
+import io.github.cemharput.streamlab.testsupport.CountingChannelFactory.CountingChannel;
 import io.github.cemharput.streamlab.tokenstream.v1.FaultSpec;
 import io.github.cemharput.streamlab.tokenstream.v1.FaultType;
 import io.github.cemharput.streamlab.tokenstream.v1.GenerateRequest;
@@ -29,19 +38,24 @@ import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
+import java.util.stream.Stream;
 import org.awaitility.core.ConditionTimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.context.SmartLifecycle;
 
 /**
  * The stream contract against the real in-process simulator, run on {@link StreamBridge} (REAL) and on the flawed
@@ -60,6 +74,7 @@ class StreamContractTest {
     private static final Duration SAMPLE_WINDOW = Duration.ofMillis(500);
 
     private SimulatorServer server;
+    private String serverName;
     private ManagedChannel channel;
     private ManagedChannel adminChannel;
     private final List<RecordingEmitter> emitters = new CopyOnWriteArrayList<>();
@@ -68,6 +83,7 @@ class StreamContractTest {
     @BeforeEach
     void setUp() throws Exception {
         String name = InProcessServerBuilder.generateName();
+        serverName = name;
         server = SimulatorServer.start(
                 InProcessServerBuilder.forName(name),
                 new SimulatorConfig(0, Duration.ofSeconds(2), 2, RequestLimits.DEFAULT));
@@ -140,6 +156,59 @@ class StreamContractTest {
     @EnumSource(Kind.class)
     void slowConsumerStaysWithinQueueBound(Kind kind) {
         runAndAssert(kind, Scenario.SLOW_CONSUMER);
+    }
+
+    // ---- the contract in both connection modes ---------------------------------------------------------------
+
+    static Stream<Arguments> modesAndScenarios() {
+        Scenario[] scenarios = {Scenario.COMPLETION, Scenario.UPSTREAM_ERROR, Scenario.CLIENT_GONE,
+                Scenario.SHUTDOWN_CANCEL, Scenario.FIRST_CHUNK_TIMEOUT, Scenario.SLOW_CONSUMER};
+        return Arrays.stream(ConnectionMode.values())
+                .flatMap(mode -> Arrays.stream(scenarios).map(scenario -> Arguments.of(mode, scenario)));
+    }
+
+    /**
+     * The same REAL contract with the channel taken from the real provider of each mode. On top of the contract:
+     * per-request opens one channel and shuts it down once (never shutdownNow); shared opens one channel at start
+     * and does not touch it until the provider stops.
+     */
+    @ParameterizedTest(name = "{0} / {1}")
+    @MethodSource("modesAndScenarios")
+    void contractHoldsInEveryConnectionMode(ConnectionMode mode, Scenario scenario) throws Exception {
+        CountingChannelFactory factory = new CountingChannelFactory(
+                target -> InProcessChannelBuilder.forName(serverName).build());
+        GatewayProperties properties = StreamTestSupport.properties(mode, DRAIN_TIMEOUT, Limits.defaults(),
+                Timeouts.defaults());
+        ChannelProvider provider = mode == ConnectionMode.SHARED
+                ? new SharedChannelProvider(factory, properties)
+                : new PerRequestChannelProvider(factory, properties);
+        SmartLifecycle lifecycle = (SmartLifecycle) provider;
+        lifecycle.start();
+        try {
+            CountingLease lease = new CountingLease(provider.acquire());
+            UpstreamStarter starter = (upstreamRequest, deadline, observer) -> TokenStreamServiceGrpc
+                    .newStub(lease.channel())
+                    .withDeadlineAfter(deadline.toNanos(), TimeUnit.NANOSECONDS)
+                    .generateTokens(upstreamRequest, observer);
+            runAndAssert(Kind.REAL, scenario, lease, starter);
+
+            assertThat(factory.created()).as("channels created").isEqualTo(1);
+            CountingChannel upstream = factory.channels().get(0);
+            if (mode == ConnectionMode.PER_REQUEST) {
+                assertThat(upstream.shutdownCalls()).as("shutdown calls").isEqualTo(1);
+                assertThat(upstream.shutdownNowCalls()).as("shutdownNow calls").isZero();
+                await().atMost(PRECONDITION_WAIT).until(upstream::isTerminated);
+            } else {
+                assertThat(upstream.shutdownCalls()).as("shared channel shutdown before stop").isZero();
+                assertThat(upstream.shutdownNowCalls()).isZero();
+            }
+        } finally {
+            lifecycle.stop();
+        }
+        await().atMost(PRECONDITION_WAIT).until(() -> factory.channels().stream().allMatch(CountingChannel::isTerminated));
+        if (provider instanceof PerRequestChannelProvider perRequest) {
+            assertThat(perRequest.openChannels()).isZero();
+        }
     }
 
     // ---- the harness itself ---------------------------------------------------------------------------------
@@ -374,6 +443,14 @@ class StreamContractTest {
     }
 
     private Observation runAndAssert(Kind kind, Scenario scenario) {
+        CountingLease lease = new CountingLease();
+        UpstreamStarter starter = (upstreamRequest, deadline, observer) -> TokenStreamServiceGrpc.newStub(channel)
+                .withDeadlineAfter(deadline.toNanos(), TimeUnit.NANOSECONDS)
+                .generateTokens(upstreamRequest, observer);
+        return runAndAssert(kind, scenario, lease, starter);
+    }
+
+    private Observation runAndAssert(Kind kind, Scenario scenario, CountingLease lease, UpstreamStarter starter) {
         boolean slow = scenario == Scenario.SLOW_CONSUMER;
         int capacity = slow ? 4 : 16;
         RecordingEmitter emitter = slow ? RecordingEmitter.stalled() : RecordingEmitter.responsive();
@@ -382,10 +459,6 @@ class StreamContractTest {
                 scenario == Scenario.FIRST_CHUNK_TIMEOUT ? Duration.ofMillis(300) : Duration.ofSeconds(30),
                 Duration.ofSeconds(30));
         timeoutsStarted.add(timeouts);
-        CountingLease lease = new CountingLease();
-        UpstreamStarter starter = (upstreamRequest, deadline, observer) -> TokenStreamServiceGrpc.newStub(channel)
-                .withDeadlineAfter(deadline.toNanos(), TimeUnit.NANOSECONDS)
-                .generateTokens(upstreamRequest, observer);
         StreamUnderTest unit = StreamUnderTest.create(kind, new Wiring(request(scenario), emitter, lease, timeouts,
                 capacity, starter, Duration.ofSeconds(60), DRAIN_TIMEOUT));
 

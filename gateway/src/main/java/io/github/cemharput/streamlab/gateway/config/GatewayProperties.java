@@ -14,6 +14,9 @@ public record GatewayProperties(
         @DefaultValue Retry retry) {
 
     public GatewayProperties {
+        if (connectionMode == null) {
+            throw new IllegalArgumentException("lab.connection-mode must be shared or per-request");
+        }
         if (upstream != null && retry != null) {
             requireShorterThanDeadline(retry.maxBackoff(), "lab.retry.max-backoff", upstream.streamDeadline());
         }
@@ -24,9 +27,23 @@ public record GatewayProperties(
         }
     }
 
-    /** Only the shared mode exists in this feature; per-request arrives later. */
+    /**
+     * How streams get their upstream channel: one lifecycle-managed channel for all streams, or one channel per
+     * stream that is opened with the stream's first upstream call and closed when the stream ends.
+     */
     public enum ConnectionMode {
-        SHARED
+        SHARED("shared"), PER_REQUEST("per_request");
+
+        private final String tag;
+
+        ConnectionMode(String tag) {
+            this.tag = tag;
+        }
+
+        /** Low-cardinality metric tag value. */
+        public String tag() {
+            return tag;
+        }
     }
 
     public record Upstream(

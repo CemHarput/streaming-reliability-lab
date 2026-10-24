@@ -11,7 +11,7 @@ server:
   shutdown: graceful
 
 lab:
-  connection-mode: shared
+  connection-mode: shared   # shared | per-request
   upstream:
     target: localhost:50051
     stream-deadline: 60s

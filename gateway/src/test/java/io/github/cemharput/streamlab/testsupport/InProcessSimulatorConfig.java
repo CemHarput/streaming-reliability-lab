@@ -33,10 +33,17 @@ public class InProcessSimulatorConfig {
 
     private final String name = InProcessServerBuilder.generateName();
     private final FaultInjectingInterceptor faults = new FaultInjectingInterceptor();
+    private final CountingChannelFactory channelFactory = new CountingChannelFactory(
+            target -> InProcessChannelBuilder.forName(name).intercept(faults).build());
 
     /** Test-side fault plan for the gateway channel; the simulator itself is untouched. */
     public FaultInjectingInterceptor faults() {
         return faults;
+    }
+
+    /** Counts the channels the gateway creates and shuts down (the factory wraps the in-process channel builder). */
+    public CountingChannelFactory channelFactory() {
+        return channelFactory;
     }
 
     /**
@@ -89,6 +96,6 @@ public class InProcessSimulatorConfig {
     @Bean
     @Primary
     ManagedChannelFactory inProcessChannelFactory(SimulatorServer simulator) {
-        return target -> InProcessChannelBuilder.forName(name).intercept(faults).build();
+        return channelFactory;
     }
 }

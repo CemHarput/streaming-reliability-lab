@@ -6,6 +6,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.ConnectionMode;
 import io.github.cemharput.streamlab.gateway.config.GatewayProperties.OverloadPolicy;
+import io.github.cemharput.streamlab.gateway.upstream.ChannelProvider;
+import io.github.cemharput.streamlab.gateway.upstream.PerRequestChannelProvider;
+import io.github.cemharput.streamlab.gateway.upstream.SharedChannelProvider;
 import io.github.cemharput.streamlab.testsupport.InProcessSimulatorConfig;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
@@ -142,9 +145,39 @@ class ConnectionModeConfigTest {
                 .hasStackTraceContaining("lab.upstream.stream-deadline");
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"per-request", "per_request", "PER_REQUEST"})
+    void perRequestModeIsBoundFromRelaxedNames(String spelling) {
+        try (ConfigurableApplicationContext context = builder().run("--lab.connection-mode=" + spelling)) {
+            assertThat(context.getBean(GatewayProperties.class).connectionMode()).isEqualTo(ConnectionMode.PER_REQUEST);
+            assertThat(context.getBeansOfType(ChannelProvider.class)).hasSize(1);
+            assertThat(context.getBean(ChannelProvider.class)).isInstanceOf(PerRequestChannelProvider.class);
+        }
+    }
+
     @Test
-    void perRequestModeFailsAtStartup() {
-        assertThatThrownBy(() -> builder().run("--lab.connection-mode=per-request").close())
+    void sharedModeHasTheSharedProvider() {
+        try (ConfigurableApplicationContext context = builder().run()) {
+            assertThat(context.getBeansOfType(ChannelProvider.class)).hasSize(1);
+            assertThat(context.getBean(ChannelProvider.class)).isInstanceOf(SharedChannelProvider.class);
+        }
+    }
+
+    @Test
+    void invalidConnectionModeFailsAtStartup() {
+        assertThatThrownBy(() -> builder().run("--lab.connection-mode=pooled").close())
                 .hasStackTraceContaining("lab.connection-mode");
+    }
+
+    @Test
+    void emptyConnectionModeFailsAtStartup() {
+        // The properties binding alone would treat an empty value as unset and run the shared mode silently.
+        assertThatThrownBy(() -> builder().run("--lab.connection-mode=").close())
+                .hasStackTraceContaining("lab.connection-mode must be shared or per-request, but it is empty");
+        assertThatThrownBy(() -> builder().run("--lab.connection-mode=   ").close())
+                .hasStackTraceContaining("lab.connection-mode must be shared or per-request, but it is empty");
+        // The environment resolves relaxed spellings of the name, so they are rejected the same way.
+        assertThatThrownBy(() -> builder().run("--lab.connectionMode=").close())
+                .hasStackTraceContaining("lab.connection-mode must be shared or per-request, but it is empty");
     }
 }

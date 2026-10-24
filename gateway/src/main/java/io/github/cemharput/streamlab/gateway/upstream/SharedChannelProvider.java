@@ -34,6 +34,7 @@ public class SharedChannelProvider implements ChannelProvider, SmartLifecycle {
         channel = created;
         running = true;
         LOGGER.log(Level.INFO, "Upstream channel created for {0}", properties.upstream().target());
+        LOGGER.log(Level.INFO, "Upstream connection mode shared: one channel to {0}", properties.upstream().target());
         watch(created, created.getState(true));
     }
 

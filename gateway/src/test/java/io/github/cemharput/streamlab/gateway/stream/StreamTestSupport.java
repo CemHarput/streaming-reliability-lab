@@ -45,8 +45,13 @@ final class StreamTestSupport {
     }
 
     static GatewayProperties properties(Duration drainTimeout, Limits limits, Timeouts timeouts) {
+        return properties(ConnectionMode.SHARED, drainTimeout, limits, timeouts);
+    }
+
+    static GatewayProperties properties(ConnectionMode mode, Duration drainTimeout, Limits limits,
+            Timeouts timeouts) {
         return new GatewayProperties(
-                ConnectionMode.SHARED,
+                mode,
                 new Upstream("localhost:1", Duration.ofSeconds(60)),
                 new Shutdown(drainTimeout, Duration.ofSeconds(1)),
                 limits,
@@ -202,15 +207,31 @@ final class StreamTestSupport {
     static final class CountingLease implements ChannelProvider.Lease {
 
         final java.util.concurrent.atomic.AtomicInteger closes = new java.util.concurrent.atomic.AtomicInteger();
+        private final ChannelProvider.Lease delegate;
+
+        CountingLease() {
+            this(null);
+        }
+
+        /** Counts closes and forwards channel() and close() to a real lease. */
+        CountingLease(ChannelProvider.Lease delegate) {
+            this.delegate = delegate;
+        }
 
         @Override
         public Channel channel() {
-            throw new UnsupportedOperationException();
+            if (delegate == null) {
+                throw new UnsupportedOperationException();
+            }
+            return delegate.channel();
         }
 
         @Override
         public void close() {
             closes.incrementAndGet();
+            if (delegate != null) {
+                delegate.close();
+            }
         }
     }
 

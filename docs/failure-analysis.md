@@ -201,6 +201,18 @@ dependent, not asserted):
 
 The class took about 10.9 s (surefire, JaCoCo agent on) on that machine.
 
+## Connection modes
+
+`StreamContractTest#contractHoldsInEveryConnectionMode` runs the REAL expectation (no violations) for six
+simulator scenarios (completion, upstream error, client gone, shutdown cancel, first-chunk timeout, slow
+consumer) with the channel taken from the real shared provider and from the real per-request provider, against
+the in-process simulator. The contract itself is unchanged. As an additional observation, per-request mode must
+open one channel per stream and shut it down once, never with `shutdownNow()`; shared mode must not touch its
+channel until the provider stops. The terminal-path race tests still use a fake upstream starter and no
+provider, so they do not exercise the channel close; the lease races are in `PerRequestChannelProviderTest`.
+Like the other stress tests, these cannot prove that no race exists. See
+[ADR-0003](adr/0003-per-request-connection-mode.md).
+
 ## Running it
 
 ```
