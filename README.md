@@ -379,6 +379,10 @@ tests and run on `StreamBridge` and on a deliberately flawed `LeakyStreamHandler
 asserts that exactly the two known flaws are detected, so the build stays green. See
 [docs/failure-analysis.md](docs/failure-analysis.md). The REAL race stress cannot prove
 that no race exists; that argument is the compare-and-set in `StreamBridge.claim()`.
+Six more pairs of terminal paths (timeout, upstream error and queue overflow against a competing
+completion, client gone or shutdown cancel; the exact pairs are listed in that document) and the admission-versus-shutdown
+race of the registry are stressed the same way, per iteration and
+without asserting the winner; details in the same document.
 
 ### Settings
 
