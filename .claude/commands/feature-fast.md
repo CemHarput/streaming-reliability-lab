@@ -24,5 +24,9 @@ Input: $ARGUMENTS
 4. Make the smallest complete change in this main session. Do not create a saved
    plan, invoke a planner/implementer/reviewer, or write a feature report.
 5. Run focused tests and relevant required checks for the changed behavior.
-   Briefly report changed files, check commands/results, and any remaining issue.
-   Do not commit, push, deploy, or change branches.
+6. If source files changed, refresh the code graph. Run exactly:
+   `C:\Users\cemha\repos\bgts-context-engine\.venv\Scripts\bce.exe --env-file C:\Users\cemha\repos\bgts-context-engine\.env index --repo <absolute-root> --name streaming-reliability-lab`
+   Do not interpolate request text into it. A failure (database down, bce missing)
+   is reported as a limitation with the command, never as a failed change.
+7. Briefly report changed files, check commands/results, graph refresh outcome,
+   and any remaining issue. Do not commit, push, deploy, or change branches.

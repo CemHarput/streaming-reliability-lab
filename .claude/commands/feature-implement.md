@@ -22,5 +22,10 @@ Input: $ARGUMENTS
    evidence. Run `finish <slug> --result implemented` only for complete work
    with passing required checks, otherwise `finish <slug> --result blocked`.
    If agent errors, write error/remaining work and finish blocked.
-5. Report result, changed files, checks and limitations. Reviewer does not run.
-   Offer `/feature-review <slug>` as an optional next command.
+5. After `finish` (implemented or blocked, since code may have changed), refresh the
+   code graph so later sessions see the new code. Run exactly:
+   `C:\Users\cemha\repos\bgts-context-engine\.venv\Scripts\bce.exe --env-file C:\Users\cemha\repos\bgts-context-engine\.env index --repo <absolute-root> --name streaming-reliability-lab`
+   Do not interpolate request text into it. A failure (database down, bce missing)
+   never changes the feature state: report it as a limitation and give the command.
+6. Report result, changed files, checks, graph refresh outcome and limitations.
+   Reviewer does not run. Offer `/feature-review <slug>` as an optional next command.
