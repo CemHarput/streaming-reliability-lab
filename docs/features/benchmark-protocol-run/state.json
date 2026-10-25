@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "slug": "benchmark-protocol-run",
+  "status": "implemented",
+  "review": "completed",
+  "created_at": "2026-10-25T08:50:41.413588+00:00",
+  "updated_at": "2026-10-25T19:45:24.795531+00:00",
+  "approved_plan_sha256": "75f39af23361207ef902c68814ecf6bf0c6a503e5262fc9001a2816b20296335",
+  "baseline_head": "1fa78dc54878befc63d2d39a86eb7543a520b0ee",
+  "approved_at": "2026-10-25T09:04:59.558451+00:00",
+  "reviewed_at": "2026-10-25T19:45:24.795518+00:00"
+}

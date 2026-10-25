@@ -11,6 +11,11 @@ Everything is synthetic: no real LLM, no API key.
 > channel per request) are done and tested. The two modes have not been
 > compared for performance. The load generator (closed model, raw JSONL output) is done and
 > tested against an in-test server; it has not been used for any measurement yet.
+>
+> The benchmark protocol runner (`bench/`, [protocol](docs/benchmark-protocol.md)) is done: it starts fresh
+> simulator and gateway JVMs per run, drives the load generator and writes raw results plus a manifest. It has been
+> checked end to end with a short smoke preset only; no benchmark has been run and the repository contains no
+> measurement results.
 
 ## Problem
 
@@ -37,6 +42,7 @@ Chat UI, user accounts, RAG, vector databases, multi-cloud, Kubernetes.
 | `simulator/` | Synthetic gRPC token producer with timing and fault injection | done |
 | `gateway/` | Spring Boot SSE gateway: lifecycle, bounded queue, gRPC adapter | shared channel + selectable connection modes (shared / per-request) + SSE bridge + bounded resources (limit, per-stream queue, metrics) + first-chunk/idle timeouts and upstream-cancel checks + bounded reconnect (retry with backoff, resume) done |
 | `loadgen/` | Load generator client: closed model + linear ramp, raw JSONL + convenience summary (HdrHistogram); open model deferred | closed model done; no performance claim |
+| `bench/` | Benchmark protocol runner: per-run fresh JVMs, pinned settings, ABBA run order, raw results + manifest (no analysis) | runner + protocol v1 done; no performance claim |
 
 ## Simulator
 
@@ -627,12 +633,50 @@ so memory grows if the disk cannot keep up.
   so loadgen validates the ranges itself (its limits mirror `RequestLimits.DEFAULT` of the simulator and may drift).
 - The gateway sends no SSE heartbeat, so a client idle timeout has to be larger than the gateway's own.
 
+## Benchmark protocol
+
+`bench/` runs the written [benchmark protocol](docs/benchmark-protocol.md) (protocol version 1): for every cell
+(concurrency x connection mode x repetition) it starts a fresh simulator and gateway JVM, waits for readiness within
+fixed bounds, verifies the connection mode from the `connection_mode` metric, runs a warm-up and a measured loadgen
+run, takes metric snapshots before and after, stops the processes and checks that the ports are free. Raw files and a
+`manifest.json` land in `bench/results/<run-id>/` (ignored by git). **This harness and its results make no performance
+claim; it compares nothing by itself.** The runner analyses nothing and ranks nothing; stability problems are only
+recorded as flags (see the protocol).
+
+```bash
+./mvnw -B package -DskipTests                                        # the runner never builds; run this first
+java -jar bench/target/bench-0.1.0-SNAPSHOT.jar --dry-run            # plan and exact commands, starts nothing
+java -jar bench/target/bench-0.1.0-SNAPSHOT.jar --preset smoke --dry-run
+java -jar bench/target/bench-0.1.0-SNAPSHOT.jar --preset smoke --checklist yes   # short harness check (4 runs)
+java -jar bench/target/bench-0.1.0-SNAPSHOT.jar                      # default set: 24 runs, nominal duration printed by --dry-run
+java -jar bench/target/bench-0.1.0-SNAPSHOT.jar --help
+```
+
+- Before a run set the operator checklist (other applications closed, AC power, power plan) is asked; `--checklist ask`
+  needs an interactive terminal (otherwise exit code 2), `--checklist yes|skip` records the answer without asking.
+  A `no` or a skipped checklist hides nothing, it only adds a flag.
+- Exit codes: 0 all planned runs completed (flags do not change it), 1 harness or run failure (the manifest says
+  `failed`; exceptions: if the result directory cannot be created there is neither directory nor manifest, and if not even a
+  minimal manifest can be written, for example on a full disk, there is none, and if writing the manifest keeps failing
+  during the run the runner makes one direct write (second temp file, atomic move) of the complete manifest state with its current status,
+  and if that fails too `manifest.json` keeps its last written status, e.g. `running`, and the full state stays in
+  `manifest.json.direct.tmp` (path printed) if that file could be written; a leftover `manifest.json.tmp` may remain), 2 invalid arguments or failed precondition (nothing started, no directory created).
+- Windows: `Process.destroy()` is a hard termination, so the graceful shutdown of gateway and simulator is not exercised
+  (the recorded stop method is `destroy`). Press Ctrl+C in the console to interrupt; the runner then kills its children
+  and marks the manifest `interrupted` (observed in a plain Windows console; PowerShell, Windows Terminal and Git Bash
+  (mintty) were not verified separately); if the
+  runner is killed hard, no cleanup runs and leftover `java` processes must be stopped by hand (their PIDs are in the
+  manifest).
+- Archive a result directory with `tar -czf bench-<run-id>.tar.gz -C bench/results <run-id>` (or `Compress-Archive`) and
+  attach it to a release or issue; do not commit it.
+
 ## Decisions
 
 - [ADR-0001: Synthetic simulator on plain grpc-java](docs/adr/0001-simulator-on-plain-grpc-java.md)
 - [ADR-0002: Single terminal claim by CAS; capacity released before the terminal write](docs/adr/0002-single-terminal-claim.md)
 - [ADR-0003: Per-request connection mode](docs/adr/0003-per-request-connection-mode.md)
 - [ADR-0004: Closed-model load generator with raw output](docs/adr/0004-loadgen-closed-model-raw-output.md)
+- [ADR-0005: Benchmark protocol runner as a plain-Java module](docs/adr/0005-benchmark-runner.md)
 
 ## License
 

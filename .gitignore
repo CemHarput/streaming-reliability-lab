@@ -9,5 +9,8 @@ target/
 # Benchmark output: commit only small summaries under results/
 results/raw/
 
+# Benchmark runner output (raw data, one directory per run set; archive it, do not commit it)
+bench/results/
+
 # IDE
 .idea/
