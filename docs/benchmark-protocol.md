@@ -4,7 +4,9 @@ Protocol version: 1
 
 This document is the written protocol that the `bench/` runner implements. The runner produces **raw data and a
 manifest, nothing else**. It does not analyse, rank or compare, and neither this document nor the runner makes a
-performance claim. Interpreting a result set is a separate step that is not part of this protocol version.
+performance claim. Interpreting a result set is a separate step that is not part of this protocol version: the `report/`
+module reads one result set read-only and writes a descriptive report ([benchmark-report.md](benchmark-report.md); see
+the README section "Benchmark report"). It changes neither the protocol nor the manifest, and the protocol version stays 1.
 
 ## 1. The question
 
@@ -325,7 +327,9 @@ No example manifest is committed: invented numbers could be mistaken for a resul
 ## 9. Archiving
 
 Result directories are not committed. Archive one with `tar -czf bench-<run-id>.tar.gz -C bench/results <run-id>` (Git
-Bash and the `tar.exe` of Windows 11) or PowerShell `Compress-Archive`, and attach the archive to a release or an issue.
+Bash and the `tar.exe` of Windows 11) or PowerShell `Compress-Archive`, and attach the archive to a release or an issue. To regenerate the report from an archived set, extract it into a new, empty
+directory outside the repository and run `java -jar report/target/report-0.1.0-SNAPSHOT.jar --results <extracted-dir>
+--out docs --overwrite` (after `./mvnw -B package -DskipTests`); the tool never modifies the set.
 
 ## 10. Harness limits and observations
 

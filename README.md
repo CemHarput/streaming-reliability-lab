@@ -16,6 +16,10 @@ Everything is synthetic: no real LLM, no API key.
 > simulator and gateway JVMs per run, drives the load generator and writes raw results plus a manifest. It has been
 > checked end to end with a short smoke preset only; no benchmark has been run and the repository contains no
 > measurement results.
+>
+> The benchmark report tool (`report/`, [placeholder report](docs/benchmark-report.md)) is done and tested with
+> synthetic result sets: it reads one result set of the runner and writes a descriptive report, derived tables and charts.
+> No result set has been analysed yet, so the committed report is a placeholder without numbers.
 
 ## Problem
 
@@ -43,6 +47,7 @@ Chat UI, user accounts, RAG, vector databases, multi-cloud, Kubernetes.
 | `gateway/` | Spring Boot SSE gateway: lifecycle, bounded queue, gRPC adapter | shared channel + selectable connection modes (shared / per-request) + SSE bridge + bounded resources (limit, per-stream queue, metrics) + first-chunk/idle timeouts and upstream-cancel checks + bounded reconnect (retry with backoff, resume) done |
 | `loadgen/` | Load generator client: closed model + linear ramp, raw JSONL + convenience summary (HdrHistogram); open model deferred | closed model done; no performance claim |
 | `bench/` | Benchmark protocol runner: per-run fresh JVMs, pinned settings, ABBA run order, raw results + manifest (no analysis) | runner + protocol v1 done; no performance claim |
+| `report/` | Benchmark report tool: reads one result set read-only, writes a descriptive report, CSV/JSON tables and SVG dot plots (no inference) | tool done, tested with synthetic sets; no result set analysed yet; no performance claim |
 
 ## Simulator
 
@@ -670,6 +675,60 @@ java -jar bench/target/bench-0.1.0-SNAPSHOT.jar --help
 - Archive a result directory with `tar -czf bench-<run-id>.tar.gz -C bench/results <run-id>` (or `Compress-Archive`) and
   attach it to a release or issue; do not commit it.
 
+## Benchmark report
+
+`report/` reads **one** result set written by the runner (`bench/results/<run-id>/`, archived and extracted, never
+committed) and writes a descriptive report. **The report describes one result set on one machine; no performance claim.**
+It shows what was measured and under which recorded conditions, which runs were excluded and why, per run metrics, and
+per concurrency the two modes side by side (per repetition, with run index and ABBA position, median and range). Its
+sentences come from a closed set of templates (`{...}` are numbers, mode names, the metric and the concurrency; values are
+shown with enough decimals that the facts the rule used stay visible):
+
+- higher: "In this result set, at concurrency {c}, the median {metric} of {m1} ({v1}) was higher than that of {m2} ({v2});
+  the ranges did not overlap and the difference between the medians ({d}) was larger than the largest within-mode range
+  ({s}). With n={n1} and n={n2} repetitions this describes this set only."
+- cannot separate, ranges overlap: "In this result set, at concurrency {c}, the median {metric} was {v1} for {m1} and {v2}
+  for {m2}; the ranges overlapped; this set cannot separate the two modes on this metric. With n={n1} and n={n2}
+  repetitions this describes this set only."
+- cannot separate, spread: "In this result set, at concurrency {c}, the median {metric} was {v1} for {m1} and {v2} for
+  {m2}; the ranges did not overlap, but the difference between the medians ({d}) was not larger than the largest
+  within-mode range ({s}); this set cannot separate the two modes on this metric. With n={n1} and n={n2} repetitions this
+  describes this set only."
+- equal medians: "In this result set, at concurrency {c}, the median {metric} of {m1} ({v1}) and of {m2} ({v2}) were
+  equal; this set cannot separate the two modes on this metric. With n={n1} and n={n2} repetitions this describes this
+  set only."
+- insufficient: "In this result set, at concurrency {c}, there were fewer than two usable repetitions for {modes} for the
+  {metric}; no comparison is stated."
+
+The report has no p-values, no confidence intervals, no ranking and no pooled
+percentiles, and it states when a set cannot separate the modes. The protocol's "What it cannot answer" list is quoted
+verbatim in it. A scan for forbidden phrases and for absolute paths runs over every output file before anything is written (the standard output summary is only scanned for paths). It never modifies the
+result set.
+
+```bash
+./mvnw -B package -DskipTests                                                                  # builds report/target
+java -jar report/target/report-0.1.0-SNAPSHOT.jar --help
+java -jar report/target/report-0.1.0-SNAPSHOT.jar --results <result-set-dir> --check            # read and validate only
+java -jar report/target/report-0.1.0-SNAPSHOT.jar --results <result-set-dir> --out docs --overwrite
+java -jar report/target/report-0.1.0-SNAPSHOT.jar --placeholder --out docs --overwrite          # no result set analysed yet
+```
+
+- `--out docs` writes `docs/benchmark-report.md` (fully generated, do not edit) and `docs/benchmark/` (`runs.csv`,
+  `cells.csv`, `analysis.json`, four SVG charts). The file list is fixed; an existing file is only replaced with
+  `--overwrite`; `--out` (also a `benchmark/` link below it) must not resolve into the result set. A smoke set needs `--allow-smoke`. In the CSV files, text cells that start with `=`, `+`, `-`, `@`, a tab, a carriage return or a line feed are prefixed with a single quote (spreadsheet formula injection); numeric columns are written as they are. Replaced output files are new files (permissions `rw-r--r--` subject to the umask on POSIX); an existing, more restrictive mode is not preserved.
+- Exit codes: 0 success (excluded runs are reported, they are not an error), 1 unexpected error (I/O, a guard violation),
+  2 invalid usage or invalid input (an unsupported `schemaVersion` / `protocolVersion`, a missing manifest; nothing is
+  written). The last line of the standard output is one line of JSON (`report-summary`).
+- **Regenerate from an archived result set:** extract the archive into a new, empty directory outside the repository
+  (`tar -xzf bench-<run-id>.tar.gz -C <new-empty-directory>`; the extracted `<run-id>` directory contains `manifest.json`),
+  run `--check` and then `--out docs --overwrite` as above. The same input gives the same output, byte for byte (the
+  report prints the raw size of files it only lists, which depends on the line ends of the input).
+- `docs/benchmark-report.md` is currently the placeholder (`No result set analysed yet`, no numbers). After a result set
+  has been analysed, the report and `docs/benchmark/*` are the only files to commit; the raw set is not.
+- The runner and manifest findings RF1 to RF8 found while building the tool (the manifest `schemaVersion` changed without
+  a version bump, no power setting on Linux, the harness never ran on Linux, ...) are listed in
+  [ADR-0006](docs/adr/0006-benchmark-report.md); they are reported, not fixed.
+
 ## Decisions
 
 - [ADR-0001: Synthetic simulator on plain grpc-java](docs/adr/0001-simulator-on-plain-grpc-java.md)
@@ -677,6 +736,7 @@ java -jar bench/target/bench-0.1.0-SNAPSHOT.jar --help
 - [ADR-0003: Per-request connection mode](docs/adr/0003-per-request-connection-mode.md)
 - [ADR-0004: Closed-model load generator with raw output](docs/adr/0004-loadgen-closed-model-raw-output.md)
 - [ADR-0005: Benchmark protocol runner as a plain-Java module](docs/adr/0005-benchmark-runner.md)
+- [ADR-0006: Benchmark report as a separate plain-Java module](docs/adr/0006-benchmark-report.md)
 
 ## License
 

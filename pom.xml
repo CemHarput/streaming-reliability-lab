@@ -23,6 +23,7 @@
         <module>gateway</module>
         <module>loadgen</module>
         <module>bench</module>
+        <module>report</module>
     </modules>
 
     <properties>
