@@ -71,13 +71,16 @@ connection mode is generally better, and it must not be possible for a number in
   dedicated-core information); `powerPlan` is always null. The report cannot say anything about power settings there.
 - **RF3.** ARM `/proc/cpuinfo` has no `model name`, so the CPU model is null. On virtual machines `physicalCores`
   reflects the vCPU topology.
-- **RF4.** The harness was never run on Linux. The exit code after SIGTERM (for example 143) and the meaning of
-  `destroy` ("shutdown hooks ran") are unverified; the report shows both as recorded.
+- **RF4.** The harness has since run on Linux (Ubuntu 24.04, Azure VM): a smoke set and a full set of 24 runs. Both
+  child processes end with `destroy` and exit code 143 (SIGTERM). That the shutdown hooks ran is still unverified: the
+  gateway logs of the smoke set contain no shutdown message (searched for "shutdown"). The report shows both as recorded.
 - **RF5.** The checklist questions (`onAcPower`, `samePowerPlan`) are written for a desktop or Windows machine; on a Linux
   virtual machine their meaning is unclear.
 - **RF6.** Run from a tarball instead of a git clone, the runner records `GIT_UNAVAILABLE` and a null commit, so the
   identification block stays incomplete. Run it from a clone on Linux.
 - **RF7.** `failure.message` and `harnessFailure` can contain local paths. The report prints neither (only the presence
   of a harness failure).
-- **RF8.** A non-smoke set has never been produced on Linux; the `ss -tan` output is counted by `TIME-WAIT` (the code was
-  read, not run there).
+- **RF8.** The first non-smoke set on Linux (24 runs) was produced and the `ss -tan` output was counted (no
+  `TIME_WAIT_UNAVAILABLE` flag). The total TIME_WAIT count recorded before a run is exactly 803 in 13 of the 24 runs,
+  which looks like a kernel limit (`net.ipv4.tcp_max_tw_buckets` was not checked), so counts of that size are a lower
+  bound.

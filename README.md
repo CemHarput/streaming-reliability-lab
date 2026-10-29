@@ -4,23 +4,10 @@ A small but real transport layer for token streaming, used to show connection
 lifecycle, bounded concurrency, backpressure and recovery after failure.
 Everything is synthetic: no real LLM, no API key.
 
-> Status: **stage 1 in progress.** The gRPC contract, the synthetic simulator
-> and the gateway's SSE bridge with bounded resources (active
-> stream limit, per-stream queue, metrics), upstream timeouts with
-> cancellation checks and two selectable connection modes (shared channel,
-> channel per request) are done and tested. The load generator (closed model, raw JSONL output) is done and
-> tested against an in-test server, and it drove the measurements of the result set described below.
->
-> The benchmark protocol runner (`bench/`, [protocol](docs/benchmark-protocol.md)) is done: it starts fresh
-> simulator and gateway JVMs per run, drives the load generator and writes raw results plus a manifest. It has been
-> checked with a smoke preset on Windows 11 and has run the full default set once, on Linux (see below).
->
-> The benchmark report tool (`report/`) is done and tested with synthetic result sets: it reads one result set of the
-> runner and writes a descriptive report, derived tables and charts.
->
-> **One full result set has been run and analysed** (24 runs on one Azure VM, all usable, no stability flag). The
-> numbers and their limits are in [Results](#results) and in [docs/benchmark-report.md](docs/benchmark-report.md); they
-> describe that set on that machine only.
+> Status: **stage 1 in progress.** The gRPC contract, the simulator, the gateway (SSE bridge, bounded resources,
+> timeouts and cancellation, bounded reconnect, two connection modes), the load generator, the benchmark runner and the
+> report tool are done and tested. One full benchmark result set (24 runs on one Azure VM) has been run and analysed;
+> see [Results](#results). It describes that set on that machine only.
 
 ## Problem
 
@@ -180,14 +167,8 @@ Java 26). Each module with tests writes an HTML report to `<module>/target/site/
 and an XML report to `<module>/target/site/jacoco/jacoco.xml`, which the Sonar step in the CI
 workflow reads. The `proto` module has no tests and produces no report.
 
-Start the simulator (port `50051`, override with `SIMULATOR_PORT`):
-
-```bash
-./mvnw -q -pl simulator -am install -DskipTests
-./mvnw -q -pl simulator exec:java
-```
-
-With reflection enabled you can call it using `grpcurl`:
+Start the simulator as in [Quick start](#quick-start) (port `50051`, override with `SIMULATOR_PORT`). With reflection
+enabled you can call it using `grpcurl`:
 
 ```bash
 grpcurl -plaintext -d '{"request_id":"demo","seed":7,"profile":{"chunk_count":5,"chunk_interval_ms":100}}' \
@@ -369,12 +350,6 @@ Known limits of the gateway:
   has begun, shutdown no longer cancels the stream: it ends with `complete` if the
   write succeeds, or is freed as a client disconnect (no `complete` event) if the
   write fails. Nothing is ever sent after a terminal event.
-- The timers do not detect a stuck client write. They measure upstream silence only,
-  and the idle timer stops when credit runs out. The stuck-intermediate-write case
-  above therefore holds its permit until the write returns, shutdown, the emitter
-  timeout, or an idle timeout while upstream credit is still outstanding and upstream
-  is silent (not after the last chunk has been received or upstream has ended).
-- The emitter `onTimeout` hypothesis above is unchanged: it stays a hypothesis.
 - A chunk that arrives at the very instant a timer fires can lose the race: the
   timeout wins and the chunk is dropped.
 - All timers share one scheduler thread: a timer never fires earlier than configured,
@@ -416,19 +391,11 @@ default). The configured mode is logged once at startup (INFO) and exposed as
   tests count how often each channel is shut down; the other contract and race tests do not go
   through a channel provider.
 
-**Not measured by the tests.** This feature makes the two modes comparable; it makes no performance claim by itself.
-One benchmark result set (see "Benchmark report") describes both modes on one machine.
-All tests use in-process channels, which have no sockets, no event-loop threads and no connect
-backoff. Not measured or not tested:
-
-- latency and throughput of either mode
-- CPU and memory cost
-- the cost of establishing a connection per stream
-- real Netty / TCP / HTTP/2 behaviour
-- TLS
-- sharing of Netty event loops between channels
-- ports and `TIME_WAIT` under many short streams
-- the effect of connect backoff after a real network failure
+**Not covered by the tests.** The tests use in-process channels (no sockets, no event-loop threads, no connect
+backoff), so they say nothing about latency, throughput, CPU or memory cost, real Netty / TCP / HTTP/2 behaviour, TLS,
+sharing of event loops between channels, or connect backoff after a real network failure. The two modes are compared
+in one benchmark result set (see [Results](#results)); ports and `TIME_WAIT` under many short streams are only
+recorded there, not analysed.
 
 ### Bounded reconnect
 
@@ -576,17 +543,9 @@ already has a `scheduledOffsetNanos` field so it can be added without changing t
 
 ### Usage
 
-Start the simulator and the gateway first (the gateway defaults to the simulator on `localhost:50051` and
-listens on port 8080):
-
-```bash
-./mvnw -q -pl simulator -am install -DskipTests
-./mvnw -q -pl simulator exec:java                     # terminal 1
-./mvnw -B -pl gateway -am package -DskipTests
-java -jar gateway/target/gateway-0.1.0-SNAPSHOT.jar   # terminal 2
-```
-
-Then build and run the load generator (`target/lib/` must stay next to the jar, the manifest points to it):
+Start the simulator and the gateway first, as in [Quick start](#quick-start) (the gateway defaults to the simulator on
+`localhost:50051` and listens on port 8080). Then build and run the load generator (`target/lib/` must stay next to the
+jar, the manifest points to it):
 
 ```bash
 ./mvnw -B -pl loadgen package -DskipTests
@@ -728,8 +687,6 @@ so memory grows if the disk cannot keep up.
 
 ### Findings about the gateway (not changed)
 
-- This README did not say how to start the gateway; the commands above (`java -jar`, port 8080) were checked
-  against a local run (the simulator was started from its classes there, not through `exec:java`).
 - A 503 carries no reason in the response, only in `rejected_total{reason}`.
 - Semantic parameter errors (for example `chunks=0`) are a 200 with an `error` event `INVALID_ARGUMENT`, not a 400,
   so loadgen validates the ranges itself (its limits mirror `RequestLimits.DEFAULT` of the simulator and may drift).
@@ -741,9 +698,8 @@ so memory grows if the disk cannot keep up.
 (concurrency x connection mode x repetition) it starts a fresh simulator and gateway JVM, waits for readiness within
 fixed bounds, verifies the connection mode from the `connection_mode` metric, runs a warm-up and a measured loadgen
 run, takes metric snapshots before and after, stops the processes and checks that the ports are free. Raw files and a
-`manifest.json` land in `bench/results/<run-id>/` (ignored by git). **This harness and its results make no performance
-claim; it compares nothing by itself.** The runner analyses nothing and ranks nothing; stability problems are only
-recorded as flags (see the protocol).
+`manifest.json` land in `bench/results/<run-id>/` (ignored by git). The runner only records raw data and stability
+flags; it analyses and ranks nothing.
 
 ```bash
 ./mvnw -B package -DskipTests                                        # the runner never builds; run this first
@@ -757,50 +713,30 @@ java -jar bench/target/bench-0.1.0-SNAPSHOT.jar --help
 - Before a run set the operator checklist (other applications closed, AC power, power plan) is asked; `--checklist ask`
   needs an interactive terminal (otherwise exit code 2), `--checklist yes|skip` records the answer without asking.
   A `no` or a skipped checklist hides nothing, it only adds a flag.
-- Exit codes: 0 all planned runs completed (flags do not change it), 1 harness or run failure (the manifest says
-  `failed`; exceptions: if the result directory cannot be created there is neither directory nor manifest, and if not even a
-  minimal manifest can be written, for example on a full disk, there is none, and if writing the manifest keeps failing
-  during the run the runner makes one direct write (second temp file, atomic move) of the complete manifest state with its current status,
-  and if that fails too `manifest.json` keeps its last written status, e.g. `running`, and the full state stays in
-  `manifest.json.direct.tmp` (path printed) if that file could be written; a leftover `manifest.json.tmp` may remain), 2 invalid arguments or failed precondition (nothing started, no directory created).
+- Exit codes: 0 all planned runs completed (flags do not change it); 1 harness or run failure (the manifest says
+  `failed`; the cases where no manifest could be written are in protocol sections 8 and 11); 2 invalid arguments or
+  failed precondition (nothing started, no directory created).
 - Windows: `Process.destroy()` is a hard termination, so the graceful shutdown of gateway and simulator is not exercised
-  (the recorded stop method is `destroy`). Press Ctrl+C in the console to interrupt; the runner then kills its children
-  and marks the manifest `interrupted` (observed in a plain Windows console; PowerShell, Windows Terminal and Git Bash
-  (mintty) were not verified separately); if the
-  runner is killed hard, no cleanup runs and leftover `java` processes must be stopped by hand (their PIDs are in the
-  manifest).
+  (recorded stop method `destroy`). On Linux it is SIGTERM (exit code 143 was recorded; that the shutdown hooks ran is
+  not verified). Ctrl+C interrupts: the runner kills its children and marks the manifest `interrupted` (checked only in
+  a plain Windows console). If the runner is killed hard, no cleanup runs and leftover `java` processes must be stopped
+  by hand (their PIDs are in the manifest).
 - Archive a result directory with `tar -czf bench-<run-id>.tar.gz -C bench/results <run-id>` (or `Compress-Archive`) and
   attach it to a release or issue; do not commit it.
 
 ## Benchmark report
 
 `report/` reads **one** result set written by the runner (`bench/results/<run-id>/`, archived and extracted, never
-committed) and writes a descriptive report. **The report describes one result set on one machine; no performance claim.**
-It shows what was measured and under which recorded conditions, which runs were excluded and why, per run metrics, and
-per concurrency the two modes side by side (per repetition, with run index and ABBA position, median and range). Its
-sentences come from a closed set of templates (`{...}` are numbers, mode names, the metric and the concurrency; values are
-shown with enough decimals that the facts the rule used stay visible):
+committed) and writes a descriptive report: what was measured and under which recorded conditions, which runs were
+excluded and why, per run metrics, and per concurrency the two modes side by side (per repetition, with run index and
+ABBA position, median and range). Its comparison sentences come from a closed set of templates with five outcomes: one
+mode higher (ranges do not overlap and the difference of the medians exceeds the largest within-mode range), cannot
+separate (ranges overlap, or the difference is within the spread), equal medians, and fewer than two usable
+repetitions. Every sentence ends with "this describes this set only".
 
-- higher: "In this result set, at concurrency {c}, the median {metric} of {m1} ({v1}) was higher than that of {m2} ({v2});
-  the ranges did not overlap and the difference between the medians ({d}) was larger than the largest within-mode range
-  ({s}). With n={n1} and n={n2} repetitions this describes this set only."
-- cannot separate, ranges overlap: "In this result set, at concurrency {c}, the median {metric} was {v1} for {m1} and {v2}
-  for {m2}; the ranges overlapped; this set cannot separate the two modes on this metric. With n={n1} and n={n2}
-  repetitions this describes this set only."
-- cannot separate, spread: "In this result set, at concurrency {c}, the median {metric} was {v1} for {m1} and {v2} for
-  {m2}; the ranges did not overlap, but the difference between the medians ({d}) was not larger than the largest
-  within-mode range ({s}); this set cannot separate the two modes on this metric. With n={n1} and n={n2} repetitions this
-  describes this set only."
-- equal medians: "In this result set, at concurrency {c}, the median {metric} of {m1} ({v1}) and of {m2} ({v2}) were
-  equal; this set cannot separate the two modes on this metric. With n={n1} and n={n2} repetitions this describes this
-  set only."
-- insufficient: "In this result set, at concurrency {c}, there were fewer than two usable repetitions for {modes} for the
-  {metric}; no comparison is stated."
-
-The report has no p-values, no confidence intervals, no ranking and no pooled
-percentiles, and it states when a set cannot separate the modes. The protocol's "What it cannot answer" list is quoted
-verbatim in it. A scan for forbidden phrases and for absolute paths runs over every output file before anything is written (the standard output summary is only scanned for paths). It never modifies the
-result set.
+The report has no p-values, no confidence intervals, no ranking and no pooled percentiles. The protocol's "What it
+cannot answer" list is quoted verbatim in it. Before anything is written, every output file is scanned for forbidden
+phrases and absolute paths. It never modifies the result set.
 
 ```bash
 ./mvnw -B package -DskipTests                                                                  # builds report/target
@@ -812,7 +748,9 @@ java -jar report/target/report-0.1.0-SNAPSHOT.jar --placeholder --out docs --ove
 
 - `--out docs` writes `docs/benchmark-report.md` (fully generated, do not edit) and `docs/benchmark/` (`runs.csv`,
   `cells.csv`, `analysis.json`, four SVG charts). The file list is fixed; an existing file is only replaced with
-  `--overwrite`; `--out` (also a `benchmark/` link below it) must not resolve into the result set. A smoke set needs `--allow-smoke`. In the CSV files, text cells that start with `=`, `+`, `-`, `@`, a tab, a carriage return or a line feed are prefixed with a single quote (spreadsheet formula injection); numeric columns are written as they are. Replaced output files are new files (permissions `rw-r--r--` subject to the umask on POSIX); an existing, more restrictive mode is not preserved.
+  `--overwrite`; `--out` must not resolve into the result set. A smoke set needs `--allow-smoke`. Text cells in the CSV
+  files that start with `=`, `+`, `-`, `@`, a tab or a line break are prefixed with a single quote (spreadsheet formula
+  injection).
 - Exit codes: 0 success (excluded runs are reported, they are not an error), 1 unexpected error (I/O, a guard violation),
   2 invalid usage or invalid input (an unsupported `schemaVersion` / `protocolVersion`, a missing manifest; nothing is
   written). The last line of the standard output is one line of JSON (`report-summary`).
@@ -823,9 +761,8 @@ java -jar report/target/report-0.1.0-SNAPSHOT.jar --placeholder --out docs --ove
 - `docs/benchmark-report.md` and `docs/benchmark/*` are generated from one result set
   (`20261029T105937Z-b117ff0-dirty`, git working tree dirty at run time). When a new set has been analysed, those are the
   only files to commit; the raw set is not committed. `--placeholder` still writes the version without numbers.
-- The runner and manifest findings RF1 to RF8 found while building the tool (the manifest `schemaVersion` changed without
-  a version bump, no power setting on Linux, the harness never ran on Linux, ...) are listed in
-  [ADR-0006](docs/adr/0006-benchmark-report.md); they are reported, not fixed.
+- Findings RF1 to RF8 about the runner and the manifest (for example: `schemaVersion` changed without a version bump,
+  no power setting on Linux) are listed in [ADR-0006](docs/adr/0006-benchmark-report.md); they are reported, not fixed.
 
 ## Decisions
 
