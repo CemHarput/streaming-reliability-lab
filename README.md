@@ -8,18 +8,23 @@ Everything is synthetic: no real LLM, no API key.
 > and the gateway's SSE bridge with bounded resources (active
 > stream limit, per-stream queue, metrics), upstream timeouts with
 > cancellation checks and two selectable connection modes (shared channel,
-> channel per request) are done and tested. The two modes have not been
-> compared for performance. The load generator (closed model, raw JSONL output) is done and
-> tested against an in-test server; it has not been used for any measurement yet.
+> channel per request) are done and tested. The load generator (closed model, raw JSONL output) is done and
+> tested against an in-test server, and it drove the measurements of the result set described below.
 >
 > The benchmark protocol runner (`bench/`, [protocol](docs/benchmark-protocol.md)) is done: it starts fresh
 > simulator and gateway JVMs per run, drives the load generator and writes raw results plus a manifest. It has been
-> checked end to end with a short smoke preset only; no benchmark has been run and the repository contains no
-> measurement results.
+> checked with a smoke preset on Windows 11 and has run the full default set once, on Linux (see below).
 >
-> The benchmark report tool (`report/`, [placeholder report](docs/benchmark-report.md)) is done and tested with
-> synthetic result sets: it reads one result set of the runner and writes a descriptive report, derived tables and charts.
-> No result set has been analysed yet, so the committed report is a placeholder without numbers.
+> The benchmark report tool (`report/`) is done and tested with synthetic result sets: it reads one result set of the
+> runner and writes a descriptive report, derived tables and charts.
+>
+> **One full result set has been run and analysed:** 24 runs (concurrency 50, 100 and 150, both connection modes, 4
+> repetitions each, ABBA order) on one Azure VM (Standard_D4als_v6, 4 vCPU on 2 physical cores, Ubuntu 24.04, Sweden
+> Central). All 24 runs were usable and no run carries a stability flag. The report is
+> [docs/benchmark-report.md](docs/benchmark-report.md). In that set the per-request mode had a higher time to first
+> chunk than the shared mode at every concurrency (p50 medians 0.6 to 1.0 ms higher, on streams of about 1955 ms), and
+> at concurrency 150 about 90 % of the requests were rejected by the active stream limit of 100 in both modes. This
+> describes that set on that machine only: it is synthetic, runs on one host, has 4 repetitions per cell and states no cause.
 
 ## Problem
 
@@ -46,8 +51,8 @@ Chat UI, user accounts, RAG, vector databases, multi-cloud, Kubernetes.
 | `simulator/` | Synthetic gRPC token producer with timing and fault injection | done |
 | `gateway/` | Spring Boot SSE gateway: lifecycle, bounded queue, gRPC adapter | shared channel + selectable connection modes (shared / per-request) + SSE bridge + bounded resources (limit, per-stream queue, metrics) + first-chunk/idle timeouts and upstream-cancel checks + bounded reconnect (retry with backoff, resume) done |
 | `loadgen/` | Load generator client: closed model + linear ramp, raw JSONL + convenience summary (HdrHistogram); open model deferred | closed model done; no performance claim |
-| `bench/` | Benchmark protocol runner: per-run fresh JVMs, pinned settings, ABBA run order, raw results + manifest (no analysis) | runner + protocol v1 done; no performance claim |
-| `report/` | Benchmark report tool: reads one result set read-only, writes a descriptive report, CSV/JSON tables and SVG dot plots (no inference) | tool done, tested with synthetic sets; no result set analysed yet; no performance claim |
+| `bench/` | Benchmark protocol runner: per-run fresh JVMs, pinned settings, ABBA run order, raw results + manifest (no analysis) | runner + protocol v1 done; one full set run (see status) |
+| `report/` | Benchmark report tool: reads one result set read-only, writes a descriptive report, CSV/JSON tables and SVG dot plots (no inference) | tool done; one result set analysed ([report](docs/benchmark-report.md)); describes that set only |
 
 ## Simulator
 
@@ -320,7 +325,8 @@ default). The configured mode is logged once at startup (INFO) and exposed as
   tests count how often each channel is shut down; the other contract and race tests do not go
   through a channel provider.
 
-**Not measured yet.** This feature makes the two modes comparable; it makes no performance claim.
+**Not measured by the tests.** This feature makes the two modes comparable; it makes no performance claim by itself.
+One benchmark result set (see "Benchmark report") describes both modes on one machine.
 All tests use in-process channels, which have no sockets, no event-loop threads and no connect
 backoff. Not measured or not tested:
 
@@ -723,8 +729,9 @@ java -jar report/target/report-0.1.0-SNAPSHOT.jar --placeholder --out docs --ove
   (`tar -xzf bench-<run-id>.tar.gz -C <new-empty-directory>`; the extracted `<run-id>` directory contains `manifest.json`),
   run `--check` and then `--out docs --overwrite` as above. The same input gives the same output, byte for byte (the
   report prints the raw size of files it only lists, which depends on the line ends of the input).
-- `docs/benchmark-report.md` is currently the placeholder (`No result set analysed yet`, no numbers). After a result set
-  has been analysed, the report and `docs/benchmark/*` are the only files to commit; the raw set is not.
+- `docs/benchmark-report.md` and `docs/benchmark/*` are generated from one result set
+  (`20261029T105937Z-b117ff0-dirty`, git working tree dirty at run time). When a new set has been analysed, those are the
+  only files to commit; the raw set is not committed. `--placeholder` still writes the version without numbers.
 - The runner and manifest findings RF1 to RF8 found while building the tool (the manifest `schemaVersion` changed without
   a version bump, no power setting on Linux, the harness never ran on Linux, ...) are listed in
   [ADR-0006](docs/adr/0006-benchmark-report.md); they are reported, not fixed.
