@@ -47,7 +47,7 @@ client write is blocking and can be stuck on a client that stopped reading.
 - Once `COMPLETED` is claimed, shutdown cannot cancel the stream (its `claim` fails).
 - After a completion, upstream error, timeout or overflow a stream stays tracked in the
   registry until its terminal write returns, although it no longer holds a permit or
-  lease (README, "Known limits"); after a shutdown cancel or client gone it is removed
+  lease (docs/gateway.md, "Known limits"); after a shutdown cancel or client gone it is removed
   by `finish()` before the terminal write.
 - The guarantee comes from the CAS in `claim()`. The stress run in
   `TerminalRaceContractTest` cannot prove the absence of a race; it only checks the

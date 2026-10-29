@@ -19,7 +19,7 @@ say. Constraints: no dependency on gateway or simulator code, few dependencies, 
   `scheduledOffsetNanos`, so the open model can be added without changing the schema.
 - **Coordinated omission is disclosed, not corrected.** In the closed model latency is measured from the actual
   send; when the server slows down the offered load drops and the missing requests are never measured. The header
-  (`loadModel`, `coordinatedOmission`), the stdout summary and the README say so. The difference between
+  (`loadModel`, `coordinatedOmission`), the stdout summary and docs/loadgen.md say so. The difference between
   `scheduledOffsetNanos` and `startOffsetNanos` only shows the generator's own delay.
 - **JDK `HttpClient`, HTTP/1.1 only, virtual-thread executor.** No new dependency. HTTP/1.1 makes every open
   stream one TCP connection; HTTP/2 multiplexing would hide the connection cost this lab wants to look at. The
